@@ -6,7 +6,7 @@
 
 ## 当前收录
 
-目前已收录 4 个 Agent 的完整逐章解读：
+目前已收录 5 个 Agent 的完整逐章解读：
 
 | 目录 | Agent | 语言/栈 | 篇幅 |
 |---|---|---|---|
@@ -14,6 +14,7 @@
 | [`hermes/`](./hermes/) | Hermes | Python | 15 章 |
 | [`opencode/`](./opencode/) | OpenCode | TypeScript + Effect | 16 章 |
 | [`codex/`](./codex/) | Codex | Rust | 17 章 |
+| [`pi/`](./pi/) | pi | TypeScript | 16 章 |
 | [`analysis/`](./analysis/) | — | 横向对比文章 | — |
 
 ## 核心对比文章
@@ -30,6 +31,7 @@
 | **OpenCode** | TypeScript + Effect | 严谨型——"宁可受限也不冒险"，把不变量焊进类型 |
 | **Codex** | Rust | 保守诚实型——"在每个边界上选择诚实与保守" |
 | **Hermes** | Python | 务实粗粝型——"为无人值守、多平台、长时运行而生" |
+| **pi** | TypeScript | 自扩展、把约束外包——核心只做精简执行骨架，权限/沙箱交给扩展与容器 |
 
 ## 仓库组织约定
 
