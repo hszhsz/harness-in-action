@@ -59,24 +59,24 @@
 ### 第四部分　安全与护栏
 
 - [**第 8 章　权限与审批流：在动手前踩刹车**](./chapters/ch08-permissions.md)
-- [**第 9 章　命令安全与沙箱：AST 级别的 fail-closed 安全门**](./chapters/ch09-command-safety-and-sandbox.md)
-- [**第 10 章　Auto 模式与 YOLO 分类器：把放行权交给一个会拒绝的模型**](./chapters/ch10-auto-mode-classifier.md)
+- [**第 9 章　Bash 安全门：AST 解析、只读判定与沙箱**](./chapters/ch09-command-safety-and-sandbox.md)
+- [**第 10 章　Auto 模式与 YOLO 分类器：让模型替你点「同意」**](./chapters/ch10-auto-mode-and-classifier.md)
 
 ### 第五部分　记住一切：上下文与记忆
 
-- [**第 11 章　上下文工程（上）：非破坏式裁剪——budget / snip / microcompact**](./chapters/ch11-context-trimming.md)
-- [**第 12 章　上下文工程（下）：破坏式摘要——autocompact 与九段压缩**](./chapters/ch12-compaction.md)
-- [**第 13 章　记忆系统：CLAUDE.md 层级、memdir 与相关性预取**](./chapters/ch13-memory.md)
+- [**第 11 章　上下文瘦身（上）：预算、snip 与 microcompact**](./chapters/ch11-context-budget-snip-microcompact.md)
+- [**第 12 章　上下文瘦身（下）：autocompact 破坏式摘要**](./chapters/ch12-autocompact-destructive-summary.md)
+- [**第 13 章　记忆系统：分层 CLAUDE.md 与按需召回的 memdir**](./chapters/ch13-memory-system.md)
 
 ### 第六部分　可扩展性
 
-- [**第 14 章　子 Agent 与任务委派：AgentTool 与工具子集分层**](./chapters/ch14-subagents.md)
-- [**第 15 章　Skill 与 MCP：把外部能力接进统一工具计划**](./chapters/ch15-skills-and-mcp.md)
-- [**第 16 章　Hook 与插件：让扩展成为权限管线的一等公民**](./chapters/ch16-hooks-and-plugins.md)
+- [**第 14 章　子 agent：AgentTool 与工具子集的三层裁剪**](./chapters/ch14-subagents-agenttool.md)
+- [**第 15 章　外部能力：Skill 动态发现与 MCP 工具接入**](./chapters/ch15-skills-mcp.md)
+- [**第 16 章　用户自定义逻辑：Hooks 事件系统与 Plugin 分发单元**](./chapters/ch16-hooks-plugins.md)
 
 ### 第七部分　工程化收尾
 
-- [**第 17 章　配置·状态·可观测性·测试，与可迁移的工程原则**](./chapters/ch17-config-state-observability-testing.md)
+- [**第 17 章　收尾综合：从 CCB 提炼可迁移的 Harness 工程原则**](./chapters/ch17-synthesis-engineering-principles.md)
 
 ## 配套说明
 
