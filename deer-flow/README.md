@@ -71,16 +71,16 @@
 
 - [**第 12 章　子 Agent：task_tool、SubagentExecutor 与隔离事件循环**](./chapters/ch12-subagents.md)
 - [**第 13 章　Skill 系统：解析、权限、安全扫描与激活**](./chapters/ch13-skills.md)
-- [**第 14 章　MCP 集成：会话池、缓存与 OAuth**](./chapters/ch14-mcp.md)
+- [**第 14 章　MCP 集成：第三方能力的接入、隔离与延迟暴露**](./chapters/ch14-mcp.md)
 
 ### 第七部分　状态与运维
 
-- [**第 15 章　配置系统：AppConfig 级联、reload 边界与约束收紧**](./chapters/ch15-config.md)
-- [**第 16 章　持久化与可观测性：SQL 存储、RunJournal 与 tracing**](./chapters/ch16-persistence-observability.md)
+- [**第 15 章　配置系统：一棵校验过的树，默认即安全、热加载有边界**](./chapters/ch15-config.md)
+- [**第 16 章　持久化与可观测性：状态落盘、事件留痕、记得多但不外泄**](./chapters/ch16-persistence-observability.md)
 
 ### 第八部分　质量与收束
 
-- [**第 17 章　测试与可信度，以及可迁移的 Harness 工程原则**](./chapters/ch17-testing-and-principles.md)
+- [**第 17 章　收尾综合：从 DeerFlow 提炼出的可迁移工程原则**](./chapters/ch17-engineering-principles.md)
 
 ## 一句话画像
 
