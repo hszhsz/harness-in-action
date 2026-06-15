@@ -6,7 +6,7 @@
 
 ## 当前收录
 
-目前已收录 6 个 Agent 的完整逐章解读：
+目前已收录 7 个 Agent 的完整逐章解读：
 
 | 目录 | Agent | 语言/栈 | 篇幅 |
 |---|---|---|---|
@@ -16,6 +16,7 @@
 | [`codex/`](./codex/) | Codex | Rust | 17 章 |
 | [`pi/`](./pi/) | pi | TypeScript | 16 章 |
 | [`claude-code/`](./claude-code/) | Claude Code（CCB 还原版） | TypeScript + Bun | 17 章 |
+| [`deer-flow/`](./deer-flow/) | DeerFlow 2.0 | Python + LangGraph | 17 章 |
 | [`analysis/`](./analysis/) | — | 横向对比文章 | — |
 
 ## 核心对比文章
@@ -34,6 +35,7 @@
 | **Hermes** | Python | 务实粗粝型——"为无人值守、多平台、长时运行而生" |
 | **pi** | TypeScript | 自扩展、把约束外包——核心只做精简执行骨架，权限/沙箱交给扩展与容器 |
 | **Claude Code（CCB）** | TypeScript + Bun | 偏执型 fail-closed——默认即关闭、约束只收紧，把缓存一致性与防死循环写进每个边界 |
+| **DeerFlow 2.0** | Python + LangGraph | 务实「借壳」型——不自己造主循环，把 LangGraph `create_agent` 当心脏，所有工程意志焊进一条 14 段中间件链 |
 
 ## 仓库组织约定
 
