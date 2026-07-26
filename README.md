@@ -6,7 +6,7 @@
 
 ## 当前收录
 
-目前已收录 7 个 Agent 的完整逐章解读：
+目前已收录 8 个 Agent 的完整逐章解读：
 
 | 目录 | Agent | 语言/栈 | 篇幅 |
 |---|---|---|---|
@@ -17,6 +17,7 @@
 | [`pi/`](./pi/) | pi | TypeScript | 16 章 |
 | [`claude-code/`](./claude-code/) | Claude Code（CCB 还原版） | TypeScript + Bun | 17 章 |
 | [`deer-flow/`](./deer-flow/) | DeerFlow 2.0 | Python + LangGraph | 17 章 |
+| [`openworker/`](./openworker/) | OpenWorker | Python + Tauri/Rust | 16 章 |
 | [`analysis/`](./analysis/) | — | 横向对比文章 | — |
 
 ## 核心对比文章
@@ -24,6 +25,10 @@
 📄 **[同一个心脏，四种活法：OpenClaw / Hermes / OpenCode / Codex 的 Harness 工程对比](./analysis/harness-engineering-four-agents-comparison.md)**
 
 从十个工程维度切开四个 Agent：整体工程性格、主循环与控制流、准入与执行分离、工具系统、执行与沙箱、权限与审批、上下文压缩与记忆、持久化、扩展体系/网关/可观测性、测试与可信度。
+
+📄 **[同一个心脏，五种活法：OpenClaw / Hermes / OpenCode / Codex / OpenWorker 的 Harness 工程对比](./analysis/harness-engineering-five-agents-comparison.md)**
+
+在四种活法基础上加入 OpenWorker，重点看桌面端本地优先 Agent 如何在审批门控、连接器系统和无人值守模式上做工程取舍。
 
 ## 一句话画像
 
@@ -36,6 +41,7 @@
 | **pi** | TypeScript | 自扩展、把约束外包——核心只做精简执行骨架，权限/沙箱交给扩展与容器 |
 | **Claude Code（CCB）** | TypeScript + Bun | 偏执型 fail-closed——默认即关闭、约束只收紧，把缓存一致性与防死循环写进每个边界 |
 | **DeerFlow 2.0** | Python + LangGraph | 务实「借壳」型——不自己造主循环，把 LangGraph `create_agent` 当心脏，所有工程意志焊进一条 14 段中间件链 |
+| **OpenWorker** | Python + Tauri/Rust | 务实守门型——"在桌面上交付完成品，每一步都审批门控" |
 
 ## 仓库组织约定
 
