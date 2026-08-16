@@ -6,7 +6,7 @@
 
 ## 当前收录
 
-目前已收录 8 个 Agent 的完整逐章解读：
+目前已收录 9 个 Agent 的完整逐章解读：
 
 | 目录 | Agent | 语言/栈 | 篇幅 |
 |---|---|---|---|
@@ -18,6 +18,7 @@
 | [`claude-code/`](./claude-code/) | Claude Code（CCB 还原版） | TypeScript + Bun | 17 章 |
 | [`deer-flow/`](./deer-flow/) | DeerFlow 2.0 | Python + LangGraph | 17 章 |
 | [`openworker/`](./openworker/) | OpenWorker | Python + Tauri/Rust | 16 章 |
+| [`deepseek-harness/`](./deepseek-harness/) | DeepSeek Harness（dsh） | TypeScript + Cordis | 18 章 |
 | [`analysis/`](./analysis/) | — | 横向对比文章 | — |
 
 ## 核心对比文章
@@ -42,6 +43,7 @@
 | **Claude Code（CCB）** | TypeScript + Bun | 偏执型 fail-closed——默认即关闭、约束只收紧，把缓存一致性与防死循环写进每个边界 |
 | **DeerFlow 2.0** | Python + LangGraph | 务实「借壳」型——不自己造主循环，把 LangGraph `create_agent` 当心脏，所有工程意志焊进一条 14 段中间件链 |
 | **OpenWorker** | Python + Tauri/Rust | 务实守门型——"在桌面上交付完成品，每一步都审批门控" |
+| **DeepSeek Harness** | TypeScript + Cordis | 激进插件化型——"没有特权核心，一切皆插件，连主循环都能换" |
 
 ## 仓库组织约定
 
