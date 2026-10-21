@@ -1,157 +1,188 @@
-# 第 6 章　多 Provider 抽象：让模型可插拔
+# 第 6 章　Models 运行时：Provider 不再是一张全局表
 
-> 一个 Agent 想活得久，第一件事是别把自己绑死在某一家模型厂商上。
+> 旧版 pi 用一张全局 API 注册表找 provider；1.3 把「谁拥有模型、谁负责认证」收回到对象里。
 
-第二部分我们把执行内核拆透了。但你应该记得，内核自始至终只认一个抽象——`StreamFn`。它从不知道屏幕另一端是 Anthropic 还是 OpenAI。那么「真正跟模型说话」这件事，到底由谁、怎么完成？答案是 `packages/ai`（`@earendil-works/pi-ai`）这个最底层的包。
-
-这一章我们进入第三部分，从类型契约开始，看 pi 如何把「调模型」做成一件可插拔、可替换、可测试的事。
+上一版电子书讲的 `api-registry.ts`、`registerApiProvider()`、`streamSimple()` 门面，在 1.3 已经被 `Models` 运行时取代。这一章讲清楚新的三件套：`Provider`、`Models`、`ModelRuntime`，以及它们如何支撑 pi 的多模型、多认证、动态目录。
 
 ---
 
-## 6.1 类型契约 `packages/ai/src/types.ts`：`Model` / `Context` / `Api`
+## 6.1 三个对象，各管一段
 
-`pi-ai` 的一切都建立在几个核心类型上。先看 `Api`——它是「用哪套协议跟模型对话」的标识：
-
-```ts
-export type Api = KnownApi | (string & {});
-```
-
-`KnownApi` 是 pi 内置认识的几套协议（`anthropic-messages`、`openai-completions`、`openai-responses`、`google-generative-ai`、`mistral-conversations` 等），而 `(string & {})` 这个技巧让 `Api` 在保留已知值自动补全的同时，**允许任意字符串**——也就是说，第三方可以注册一套全新的 API 协议，类型系统不会拦你。这是「可插拔」在类型层的第一个信号。
-
-再看 `Model`，它描述一个具体模型的全部元数据：
-
-```ts
-export interface Model<TApi extends Api> {
-	id: string;
-	name: string;
-	api: TApi;            // 用哪套协议
-	provider: Provider;   // 哪家厂商
-	baseUrl: string;
-	reasoning: boolean;   // 是否支持思考
-	thinkingLevelMap?: ThinkingLevelMap;  // pi 的 thinking level → 厂商特定值
-	input: ("text" | "image")[];
-	cost: { input; output; cacheRead; cacheWrite };  // $/百万 token
-	contextWindow: number;
-	maxTokens: number;
-	headers?: Record<string, string>;
-	compat?: ...;  // OpenAI 兼容 API 的覆盖项
-}
-```
-
-注意 `Model` 用泛型 `<TApi>` 参数化，而 `compat` 字段会**根据 `TApi` 的具体值变成不同的兼容性配置类型**（`openai-completions` 对应 `OpenAICompletionsCompat`，`anthropic-messages` 对应 `AnthropicMessagesCompat`……）。这种「类型随协议变化」的设计，让 pi 能在一套统一接口下，精确表达每套协议特有的兼容性开关。
-
-`cost` 直接写进 Model，意味着**成本核算是一等公民**——每个模型自带价格表，第 7 章我们会看到 token 用量如何顺着这个价格表一路核算到底。
-
-最后是 `Context`——一次请求要发给模型的全部内容：系统提示词、消息列表、工具列表。它和第 3 章 `streamAssistantResponse` 里组装的 `llmContext` 一一对应。
-
-## 6.2 注册表 `api-registry.ts`：`registerApiProvider` 与 `sourceId` 卸载
-
-「可插拔」的核心机制是一张注册表。`packages/ai/src/api-registry.ts` 用一个 `Map` 维护「Api → Provider 实现」的映射：
-
-```ts
-const apiProviderRegistry = new Map<string, RegisteredApiProvider>();
-
-export function registerApiProvider<TApi, TOptions>(
-	provider: ApiProvider<TApi, TOptions>,
-	sourceId?: string,
-): void {
-	apiProviderRegistry.set(provider.api, {
-		provider: {
-			api: provider.api,
-			stream: wrapStream(provider.api, provider.stream),
-			streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
-		},
-		sourceId,
-	});
-}
-```
-
-每个 Provider 必须提供两个函数：`stream`（底层流式）和 `streamSimple`（带 reasoning 的统一流式）。注册时它们会被 `wrapStream` 包一层，里面做一件防御性的事——**校验 model 的 api 与注册的 api 匹配**：
-
-```ts
-function wrapStream(api, stream): ApiStreamFunction {
-	return (model, context, options) => {
-		if (model.api !== api) {
-			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
-		}
-		return stream(model, context, options);
-	};
-}
-```
-
-注册表还有两个容易被忽略但很重要的能力：
-
-- **`sourceId`**：注册时可以打一个「来源标记」。配套的 `unregisterApiProviders(sourceId)` 能把某个来源注册的所有 provider 一次性卸载。这对**扩展系统**至关重要——一个扩展可以注册自己的 provider，卸载扩展时干净地撤销，不留垃圾。
-- **`clearApiProviders()`**：清空所有注册，主要用于测试隔离。
-
-> **给 Agent 开发者的启示**：用「注册表 + sourceId」管理可插拔组件，比用一堆 `if (provider === "anthropic")` 的硬编码分支优雅得多。新增一家厂商 = 写一个 provider + 注册一次，内核与其他 provider 完全无感。
-
-那么内置的几家厂商在哪注册？看 `providers/register-builtins.ts`——它惰性地（lazy）导入并注册 Anthropic、OpenAI（completions/responses）、Google、Mistral、Bedrock 等。而这个文件在 `stream.ts` 的第一行就被 `import`，确保任何人用 `streamSimple` 前，内置 provider 已经就位。
-
-## 6.3 门面 `stream.ts`：四个对外函数
-
-回到第 2 章那条最关键的接缝。`packages/ai/src/stream.ts` 是整个 `pi-ai` 对外的门面，只有四个函数，但内核（`StreamFn`）借用的就是其中的 `streamSimple`：
-
-```ts
-export function streamSimple<TApi extends Api>(
-	model: Model<TApi>,
-	context: Context,
-	options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-	const provider = resolveApiProvider(model.api);
-	return provider.streamSimple(model, context, withEnvApiKey(model, options));
-}
-```
-
-它做的事极简：**根据 `model.api` 从注册表里查出对应 provider，调它的 `streamSimple`。** 一行路由，把「跟谁说话」的决策完全数据化了。
-
-四个函数的关系是两个维度的笛卡尔积：
-
-| | 流式（返回 EventStream） | 非流式（返回最终消息） |
+| 对象 | 位置 | 职责 |
 |---|---|---|
-| **底层**（`StreamOptions`） | `stream` | `complete` |
-| **统一**（带 `reasoning`） | `streamSimple` | `completeSimple` |
+| `Provider` | `packages/ai/src/models.ts:157` | 一个 provider 的全部行为：模型列表、认证、流式实现、图片/分类能力 |
+| `Models` | `packages/ai/src/models.ts:257` | provider 集合 + 认证解析 + 请求归一化 + 便捷方法 |
+| `ModelRuntime` | `packages/coding-agent/src/core/model-runtime.ts:173` | 产品层扩展：实现 `Models`，叠加虚拟模型、用户自定义 provider、目录刷新 |
 
-`complete` / `completeSimple` 不过是「订阅流、等最终结果」的便利封装：
+依赖方向是：`Agent` 依赖一个 `StreamFn`；`AgentSession` 依赖 `ModelRuntime`；`ModelRuntime` 实现 `Models`；`Models` 依赖 `Provider`。**越往下越不知道业务，越往上越不知道循环。**
+
+## 6.2 `Provider`：认证是 provider 自己的事
+
+这是 1.3 最重要的所有权变化。旧版把 API Key 从环境变量或注册表里「注入」给 provider；新版要求每个 provider **自带认证语义**：
 
 ```ts
-export async function completeSimple<TApi>(model, context, options?): Promise<AssistantMessage> {
-	const s = streamSimple(model, context, options);
-	return s.result();
+export interface Provider<TApi extends Api = Api> {
+	readonly id: string;
+	readonly name: string;
+	readonly baseUrl?: string;
+	readonly headers?: ProviderHeaders;
+	readonly auth: ProviderAuth;
+
+	getModels(): readonly Model<TApi>[];
+	getAllModels?(): readonly ProviderModel<TApi>[];
+	refreshModels?(context: RefreshModelsContext): Promise<void>;
+	filterModels?(models: readonly Model<TApi>[], credential: Credential | undefined): readonly Model<TApi>[];
+
+	stream<T extends TApi>(model: Model<T>, context: TranscriptContext, options?): AssistantMessageEventStream;
+	streamSimple(model: Model<TApi>, context: TranscriptContext, options?): AssistantMessageEventStream;
+	// generateImages / classify / deferred ...
 }
 ```
 
-还记得第 5 章 `AgentHarness` 压缩时调模型生成摘要吗？那种「只要最终结果、不需要流式 UI」的场景，用的就是 `completeSimple` 这类非流式函数。
+几个刻意的约束：
 
-## 6.4 环境变量 API Key 的隐式注入（`withEnvApiKey`）
+- **`auth` 是必填的**。即使是只读环境变量的 provider、AWS profile、ADC 文件，甚至本地免密钥服务，也必须提供 `apiKey` 形式的认证描述，其 `resolve()` 报告「是否已配置」。这样 `Models.getAuth()` 永远有统一答案，不需要到处写特判。
+- **`getModels()` 是同步的**。静态 provider 返回内置目录；动态 provider 返回「上次刷新的结果」，刷新前为空。不能抛异常——抛了就被当作没有模型。
+- **`refreshModels()` 是动态 provider 的增量覆盖**。它负责恢复缓存、在凭据有效时拉新列表；失败必须保留旧列表。
+- **`filterModels()` 允许凭据相关的可用性策略**。例如某些模型只对特定订阅开放。
 
-`streamSimple` 里那个 `withEnvApiKey(model, options)` 是个贴心的小设计。它的逻辑是：**如果调用方没显式传 apiKey，就尝试从环境变量里按 provider 取一个填进去**：
+这带来的直接好处是：**认证不再是一个旁路的 `withEnvApiKey` 工具函数**，而是 provider 契约的一部分。扩展注册自定义 provider 时，也必须想清楚「怎么登录、怎么刷新、哪些模型可用」。
+
+## 6.3 `Models`：集合、认证与归一化
+
+`createModels()`（`models.ts:1012`）返回一个 `MutableModels`：
 
 ```ts
-function withEnvApiKey<TOptions>(model, options): TOptions | undefined {
-	if (hasExplicitApiKey(options?.apiKey)) return options;  // 显式优先
-	const apiKey = getEnvApiKey(model.provider);
-	if (!apiKey) return options;
-	return { ...options, apiKey } as TOptions;
+const models = createModels();
+models.setProvider(openaiProvider());
+models.setProvider(anthropicProvider());
+```
+
+`Models` 的职责可以分成四块：
+
+### 6.3.1 目录读取
+
+```ts
+getModel(provider, id)
+getModels(provider?)
+getModelsOfType(type, provider?)
+getAllModels(provider?)
+```
+
+未限定类型的方法只返回 chat 模型；`*OfType` 返回指定类型（image / classifier）；`getAll*` 返回全部。动态 provider 的列表类型是 `Model<Api>`，需要用 `hasApi()` 收窄。
+
+### 6.3.2 可用性与认证
+
+```ts
+checkAuth(providerId)
+getAvailable(providerId?)
+getAuth(providerId | model)
+login(providerId, type, interaction)
+logout(providerId)
+refresh({ providers? })
+```
+
+`getAvailable()` 会先确认 provider 认证完整，再应用 `filterModels`。UI 的模型选择器就只列这些。
+
+`getAuth()` 可以按 provider 或按 model 解析。按 model 时会把模型自带的 headers 合并进去。失败会抛 `ModelsError`：
+
+- `code: "oauth"`：token 刷新失败，已存凭据保留，重新登录可修复；
+- `code: "auth"`：API Key 解析或凭据存储失败。
+
+请求路径会把这些拒绝转成流错误，而不是让进程崩溃。
+
+### 6.3.3 请求归一化
+
+`Models.stream()` 在派发给 provider 之前做两件事：
+
+```ts
+const transcript = normalizeContext(context);
+// ...
+const { requestModel, requestOptions } = await this.applyAuth(model, options);
+return provider.stream(requestModel, transcript, requestOptions);
+```
+
+- `normalizeContext()` 把调用方的 `Context` 转成 `TranscriptContext`。这是**唯一**能构造该类型的入口，provider 代码拿不到未归一化的上下文。
+- `applyAuth()` 解析认证、合并 baseUrl 与 headers，并把 `transformHeaders` 应用到最终请求头。
+
+`ModelsRequestTransforms` 只提供一个 `transformHeaders`，但它的位置很关键：**在模型、认证、provider 默认头全部合并完之后**。这让代理、审计、灰度等基础设施可以在最后一刻改 header，而不用改 provider。
+
+### 6.3.4 便捷方法
+
+`complete()` / `completeSimple()` / `streamDeferred()` / `fetchDeferred()` / `cancelDeferred()` / `generateImages()` / `classify()` 都是薄封装。几个契约细节：
+
+- `generateImages` / `classify` **永不 reject**：未知 provider、未配置认证、provider 不支持，都会返回一个错误结果对象。
+- `stream` / `streamSimple` 返回 `AssistantMessageEventStream`；请求准备阶段的失败通过 `lazyStream` 延迟成流错误。
+- `complete` 是 `stream(...).result()` 的语法糖，但错误仍会被编码进最终消息。
+
+## 6.4 `createProvider()`：内置 provider 与自定义 provider 共用一条路
+
+`packages/ai/src/providers/*.ts` 里每个内置 provider 都通过 `createProvider()` 构造：
+
+```ts
+export function createProvider<TApi extends Api>(input: CreateProviderOptions<TApi>): Provider<TApi> {
+	// 合并静态模型 + 动态覆盖
+	// 按 model.api 选择实现
+	// 组装 auth / getModels / refreshModels / filterModels / stream ...
 }
 ```
 
-优先级很清楚：**显式传入 > 环境变量 > 没有**。这让「本地随手跑一下」（靠 `ANTHROPIC_API_KEY` 等环境变量）和「生产里动态注入 key」（显式传 apiKey、甚至用第 4 章的 `getApiKey` 钩子每轮刷新）两种姿态共用一套代码。
+`CreateProviderOptions` 的关键字段：
 
-注意这里有个层次：`withEnvApiKey` 是**一次性**的兜底（请求构造时取一次环境变量），而第 4 章讲的 `getApiKey` 钩子是**每轮**重新解析（应对会过期的 OAuth token）。两者不冲突——`getApiKey` 解析出的 key 会作为「显式 apiKey」传进来，从而短路掉 `withEnvApiKey` 的环境变量兜底。这套分层我们在第 7 章讲 OAuth 时还会回来。
+| 字段 | 作用 |
+|---|---|
+| `models` | 静态基线目录（可含 chat / image / classifier） |
+| `fetchModels` | 动态目录覆盖，事务性发布 |
+| `api` | 单个流实现，或按 `model.api` 分派的映射 |
+| `images` / `classifiers` | 对应能力的实现映射 |
+| `filterModels` / `filterAllModels` | 凭据相关的可用性过滤 |
 
-至此，「模型可插拔」的骨架就清楚了：统一的类型契约（`Model`/`Context`/`Api`）+ 一张注册表 + 一个一行路由的门面。下一章，我们钻进 provider 内部，看流式协议、消息转换、重试和认证这些「与模型对话的脏活累活」是怎么干的。
+`createProvider` 会校验「至少有一个实现」，空映射直接报错。一个 provider 可以同时支持多种 API：例如同一个网关既有 `openai-completions` 又有 `anthropic-messages` 模型，就传一个按 `model.api` 分派的 map。**模型找不到对应实现时，返回一个流错误，而不是静默失败。**
 
----
+目前 `providers/all.ts` 汇总了 **42 个** provider 工厂。它们共享 `createProvider` 的行为，但各自的认证、目录、请求方言独立。
 
-## 本章小结
+## 6.5 模型目录：生成、缓存、叠加
 
-- `Api = KnownApi | (string & {})` 在类型层就为「第三方注册新协议」留了门；`Model<TApi>` 用泛型让 `compat` 随协议变化，并把成本（`cost`）做成一等公民。
-- `api-registry.ts` 用 `Map` 维护「Api → Provider」映射，`registerApiProvider` 注册时校验 api 匹配；`sourceId` 支持按来源批量卸载（扩展系统的关键）。
-- `stream.ts` 的四个门面函数是两个维度（流式/非流式 × 底层/统一）的笛卡尔积；`streamSimple` 的实现就是「按 `model.api` 路由」一行。
-- `withEnvApiKey` 实现「显式 key > 环境变量 > 无」的优先级兜底，与第 4 章每轮刷新的 `getApiKey` 钩子分层协作。
+pi 的模型目录不是手写的一张常量表，而是分层构建：
 
-下一章，深入 provider 内部，看流式协议、`transform-messages`、重试与 OAuth。
+1. **生成阶段**：`packages/ai/scripts/generate-models.ts` 从模型数据源生成 `models.generated.ts`；
+2. **目录层**：`model-catalog.ts` 把内置目录与远端目录合并；
+3. **运行时层**：`ModelsStore` 持久化动态 provider 的刷新结果；
+4. **产品层**：`coding-agent` 的 `models-store.ts` 在启动时恢复缓存，并在后台尝试从 pi.dev 叠加新数据。
+
+根目录的 `npm run check:model-data`、`check:model-catalog`、`check:catalog-compat` 是这套机制的护栏：模型数据或 catalog 结构变化会导致 CI 失败，避免「代码能跑但模型列表悄悄缺项」。
+
+> **给 Agent 开发者的启示**：模型目录不是配置，而是**需要版本化、可校验、可离线降级的数据产品**。pi 把它拆成生成、缓存、叠加三层，就是为了让「没有网络」和「provider 新增模型」都不至于让 Agent 瘫痪。
+
+## 6.6 `ModelRuntime`：产品层为什么还要再包一层
+
+`packages/coding-agent/src/core/model-runtime.ts` 里的 `ModelRuntime implements Models`，它不是重复造轮子，而是补三类产品需求：
+
+1. **虚拟模型**：用户选择的 `provider/model` 可能是一个路由器。`resolveModel()` 根据请求原因（user / continuation / retry / direct）、思考级别和持久化状态，解析出真正的物理模型。
+2. **用户自定义 provider**：从 `models.json` 读取 OpenAI/Anthropic 兼容端点，构造 provider 并注册进 `Models`。
+3. **认证与目录的产品化**：`/login`、`/logout`、OAuth 刷新、模型选择器、启动时的目录刷新，都需要比 `Models` 更上层的状态。
+
+因此你会看到 `AgentSession` 的认证调用是 `this._modelRuntime.getAuth(model)`，而不是直接操作 `Models`。**`Models` 是可复用的库，`ModelRuntime` 是可运行的产品。**
+
+## 6.7 一次请求的认证与路由路径
+
+把这一章串起来，一次模型请求的完整路径是：
+
+```
+AgentSession.prepareRequest
+  └─ ModelRuntime.resolveModel（若是虚拟模型）
+       └─ AgentSession._getRequiredRequestAuth
+            └─ ModelRuntime.getAuth → Provider.auth.resolve
+                 └─ Agent.streamFunction(model, TranscriptContext, options)
+                      └─ Models.streamSimple
+                           ├─ normalizeContext
+                           ├─ applyAuth（合并 baseUrl / headers）
+                           ├─ transformHeaders
+                           └─ Provider.streamSimple
+                                └─ Provider.stream → 具体 API 实现
+```
+
+每一层都只做一件事，而且都能被替换：路由可以换、认证可以换、header 变换可以换、provider 实现可以换。**这就是「模型可插拔」在工程上的真实含义。**
 
 ---
 
@@ -159,13 +190,18 @@ function withEnvApiKey<TOptions>(model, options): TOptions | undefined {
 
 | 文件 | 作用 |
 |---|---|
-| `packages/ai/src/types.ts` | `Api`/`Model`/`Context`/`SimpleStreamOptions` 等核心契约 |
-| `packages/ai/src/api-registry.ts` | provider 注册表、`sourceId` 卸载 |
-| `packages/ai/src/stream.ts` | 对外门面：`stream`/`complete`/`streamSimple`/`completeSimple` |
-| `packages/ai/src/providers/register-builtins.ts` | 内置厂商的惰性注册 |
+| `packages/ai/src/models.ts` | `Provider` / `Models` / `createModels` / `createProvider` |
+| `packages/ai/src/providers/all.ts` | 42 个内置 provider 工厂的汇总 |
+| `packages/ai/src/model-catalog.ts` | 目录合并与查询 |
+| `packages/ai/src/models.generated.ts` | 生成的内置模型数据 |
+| `packages/ai/src/models-store.ts` | 动态目录持久化 |
+| `packages/coding-agent/src/core/model-runtime.ts` | 产品层 `Models` 实现、虚拟模型 |
+| `packages/coding-agent/src/core/virtual-models.ts` | 虚拟模型定义与状态 |
+| `packages/coding-agent/docs/models.md` | 面向用户的模型配置说明 |
 
 ## 动手实验
 
-1. 在 `api-registry.ts` 里跟踪 `sourceId` 的用法，设想一个场景：你写了一个扩展，注册了一个自定义 provider。卸载扩展时，你会怎么用 `unregisterApiProviders` 确保不留残留？
-2. 写一段最小代码：构造一个 `Model`（api 用 `faux`），调用 `completeSimple`，打印返回的 `AssistantMessage`。对照 6.3 的表格，理解「非流式 = 流式 + `.result()`」。
-3. 把 `ANTHROPIC_API_KEY` 环境变量设好，再分别「传 apiKey」和「不传 apiKey」调用 `streamSimple`，用断点验证 `withEnvApiKey` 的优先级逻辑。
+1. 用 `createModels()` + `createProvider()` 手写一个最小 provider：`getModels()` 返回一个假模型，`streamSimple()` 返回一段固定文本。把它接到 `Agent` 上跑通一轮，不联网。
+2. 给这个 provider 加一个只允许特定 `credential.plan` 的 `filterModels`，调用 `getAvailable()` 验证过滤结果。
+3. 阅读 `ModelsImpl.stream()` 与 `applyAuth()`，画出「model headers、provider headers、auth headers、transformHeaders」的合并顺序。思考：为什么 `transformHeaders` 要放在最后？
+4. 在 `providers/all.ts` 里数一遍 provider 工厂，并找出至少两个「同一 provider 支持多种 api」的例子。

@@ -1,162 +1,186 @@
-# 第 9 章　可插拔的 Operations：让「动手那一刻」可替换、可远程、可加固
+# 第 9 章　可插拔执行后端：BashOperations 与文件变更队列
 
-> 一个工具最危险的，是它「真正动手」的那一行——`spawn` 一个进程、写一块磁盘。pi 把这一行单独抽成一个接口，于是它能被换成 SSH、被换成容器、被换成一个假实现。
+> 工具描述的是「语义」，Operations 描述的是「在哪儿、用什么方式落地」。
 
-第 8 章我们把工具拆到了 `execute`，但 `execute` 内部「真正动手」的那一刻——`bash` 怎么 spawn 进程、`write` 怎么落盘——还是黑盒。这一章我们打开最后一层：`Operations` 抽象。它是 pi「约束外包」哲学在工具层最锋利的体现——**工具的「做什么」与「在哪做、怎么做」被彻底分开，后者变成一个可注入的接口。**
+第 8 章讲了工具的接口。这一章往下看一层：同一个 `bash` 工具，如何在本地 shell、容器、远端 VM 上执行？同一个 `write`，如何避免并发写坏文件？答案不在工具实现里，而在 **Operations** 这一层抽象。
 
 ---
 
-## 9.1 `BashOperations`：把「执行命令」抽成一个接口
+## 9.1 每个工具都有自己的一组 Operations
 
-看 `bash` 工具的核心抽象（`core/tools/bash.ts`）。pi 没有把 `spawn` 直接写死在 `execute` 里，而是先定义了一个接口：
+pi 不是只给 bash 做了抽象。八个内置工具各自定义了最小的后端契约：
+
+| 工具 | Operations 接口 | 关键方法 |
+|---|---|---|
+| `read` | `ReadOperations` | `readFile` / `access` / `detectImageMimeType` |
+| `edit` | `EditOperations` | `readFile` / `writeFile` / `access` |
+| `write` | `WriteOperations` | `writeFile` / `mkdir` |
+| `grep` | `GrepOperations` | `isDirectory` / `readFile` |
+| `find` | `FindOperations` | `exists` / `glob` |
+| `ls` | `LsOperations` | `exists` / `stat` / `readdir` |
+| `bash` | `BashOperations` | `exec` |
+| `powershell` | `PowerShellOperations` | 等价于 `BashOperations` |
+
+这些接口的共同特点：
+
+- **只暴露语义所需的最小方法**，不泄漏`fs` 的完整能力；
+- 方法是可替换的（构造工具时传 `options.operations`）；
+- 默认实现直接用 `node:fs` 或 `child_process`；
+- 远端实现（如 Gondolin、SSH）只需实现这些方法，就能复用整个工具逻辑。
+
+以 `read` 为例：
 
 ```ts
-/**
- * Pluggable operations for the bash tool.
- * Override these to delegate command execution to remote systems (for example SSH).
- */
+export interface ReadOperations {
+	readFile: (absolutePath: string) => Promise<Buffer>;
+	access: (absolutePath: string) => Promise<void>;
+	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
+}
+```
+
+一个微 VM 后端只要实现「读文件 + 检查可读 + 探测图片类型」，就自动获得 `read` 工具的分页、截断、图片处理、错误信息等全部行为。**这就是把「策略」和「传输」分开的收益。**
+
+## 9.2 `BashOperations`：一个 `exec` 撑起的后端
+
+```ts
 export interface BashOperations {
 	exec: (
 		command: string,
 		cwd: string,
 		options: {
-			onData: (data: Buffer) => void;   // 流式输出回调
-			signal?: AbortSignal;             // 中止
-			timeout?: number;                 // 超时
-			env?: NodeJS.ProcessEnv;          // 环境变量
+			onData: (data: Buffer) => void;
+			signal?: AbortSignal;
+			timeout?: number;
+			env?: NodeJS.ProcessEnv;
 		},
 	) => Promise<{ exitCode: number | null }>;
 }
 ```
 
-注释一句话点破了它存在的全部理由：**「Override these to delegate command execution to remote systems (for example SSH)」**——重写它，就能把命令执行委托给远程系统。`bash` 工具本身只依赖这个接口，不关心命令究竟是在本地 shell、SSH 到的远程机器、还是一个容器里跑的。
+契约里有几个重要约定：
 
-这就是「机制与策略分离」在工具最底层的落地：`bash` 工具的逻辑（解析参数、流式汇报、截断输出、渲染结果）是**机制**，而「命令到底在哪个执行后端跑」是**策略**，被 `BashOperations` 这个注入点接管。
+1. **输出必须流式回调 `onData`**。工具层用 `OutputAccumulator` 实时累积，UI 才能边跑边显示。
+2. **`exitCode` 为 `null` 视为失败**。被信号终止时应报告 `128 + signalNumber`（shell 惯例）。
+3. **`timeout` 的单位是秒**，由工具 schema 传入。本地实现对上限有硬约束：`MAX_TIMEOUT_MS = 2_147_483_647`（Node 定时器上限），超过直接报错。
+4. **必须尊重 `signal`**。中止时要杀掉整个进程树，而不是只杀父进程。
 
-## 9.2 `createLocalBashOperations`：默认的本地实现里藏着多少细节
+这个接口小到可以在 20 行内实现，却足以覆盖本地 shell、容器 `exec`、SSH 通道、微 VM。
 
-pi 自带一个本地实现 `createLocalBashOperations`，它是 `BashOperations` 的默认值。别看接口只有一个 `exec`，真要把「在本地跑一条命令」做对、做安全，里面的细节多得惊人：
+## 9.3 本地实现：进程组、超时与清理
+
+`createLocalShellOperations(shellName, resolveShellConfig)` 是 bash 与 powershell 共用的执行核心。关键细节：
 
 ```ts
-export function createLocalBashOperations(options?): BashOperations {
-	return {
-		exec: async (command, cwd, { onData, signal, timeout, env }) => {
-			const { shell, args } = getShellConfig(options?.shellPath);
-			// 1. 先确认 cwd 存在，否则给一条清晰的错误
-			try { await fsAccess(cwd, constants.F_OK); }
-			catch { throw new Error(`Working directory does not exist: ${cwd}...`); }
-			// 2. 已经被 abort 就别启动了
-			if (signal?.aborted) throw new Error("aborted");
-
-			const child = spawn(shell, [...args, command], {
-				cwd,
-				detached: process.platform !== "win32",   // 关键：开新进程组
-				env: env ?? getShellEnv(),
-				stdio: ["ignore", "pipe", "pipe"],
-				windowsHide: true,
-			});
-			if (child.pid) trackDetachedChildPid(child.pid);
-			// ...
-		},
-	};
-}
+const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+	cwd,
+	detached: process.platform !== "win32",
+	env: env ?? getShellEnv(),
+	stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+	windowsHide: true,
+});
 ```
 
-逐个看这些「魔鬼细节」：
+- **`detached: true`（非 Windows）**：让子进程成为进程组组长。这样 `killProcessTree(pid)` 能一次杀掉 shell 及其所有后代——否则 `bash -c "npm test"` 里的子进程会成为孤儿。
+- **命令传输方式可配置**：有的 shell 通过 argv 传命令，有的通过 stdin（避免超长 argv 与转义问题）。
+- **超时与中止都走 `killProcessTree`**：不是 `child.kill()`，而是整棵树。
+- **进程退出后清理**：解除定时器、移除 abort 监听、关闭流，避免 Node 进程被句柄拖住。
 
-- **`detached: true` + `killProcessTree`**：命令在非 Windows 上以 `detached` 方式 spawn，开一个独立的**进程组**。为什么？因为一条 `bash` 命令可能 fork 出一堆子进程（`npm test` 拉起的 worker、`&` 后台进程……）。如果只 kill 父进程，子进程会变成「孤儿」继续跑、继续占资源。pi 在超时和 abort 时调用的是 `killProcessTree(child.pid)`——**杀整棵进程树**，斩草除根：
+还有一个容易忽略的产品化细节：bash 工具会向子进程注入 `PI_*` 环境变量：
 
-  ```ts
-  const onAbort = () => { if (child.pid) killProcessTree(child.pid); };
-  if (signal) {
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-  }
-  ```
+```
+PI_SESSION_ID / PI_SESSION_FILE / PI_PROVIDER / PI_MODEL / PI_REASONING_LEVEL
+```
 
-- **超时即杀树**：`timeout` 到了，标记 `timedOut = true` 并同样 `killProcessTree`，最后抛 `timeout:${timeout}` 让上层知道是超时而非正常退出：
+并在每次执行前删除旧值，避免从父环境泄漏。这样用户在脚本里就能知道「当前是哪个会话、哪个模型在跑我」，实现可观测的自动化。
 
-  ```ts
-  timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      if (child.pid) killProcessTree(child.pid);
-  }, timeout * 1000);
-  ```
+## 9.4 输出硬化：既不撑爆上下文，也不丢证据
 
-- **`trackDetachedChildPid` / `untrackDetachedChildPid`**：pi 全局登记所有 detached 子进程的 pid，进程退出时注销。这样即便主程序要退出，也能找到并清理掉所有还在跑的后台命令，不留僵尸。
-- **`waitForChildProcess`**：注释解释了一个微妙的坑——detached 的后代进程可能继续持有继承来的 stdio 句柄，导致「进程已退出但流不关闭、`await` 一直挂着」。pi 用专门的 `waitForChildProcess` 来正确等待退出，避免 hang。
-- **`stdio: ["ignore", "pipe", "pipe"]` + `onData`**：stdin 忽略（Agent 跑的命令不该等交互输入），stdout/stderr 都接到 `onData` 流式回调——这正是第 8 章 `execute` 的 `onUpdate` 能实时回显命令输出的源头。
+命令输出是不可信的：`npm install` 可能刷出几十万行，`cat` 一个二进制文件可能直接让终端崩掉。pi 用 `OutputAccumulator` 做三层处理：
 
-> **给 Agent 开发者的启示**：「让 Agent 能跑 shell 命令」听起来是一行 `spawn`，但要做到**能中止、能超时、能杀干净子孙进程、不 hang、不留僵尸**，是一整套工程。pi 把这套复杂度封进 `createLocalBashOperations`，对外只露一个干净的 `exec` 接口——这才是「可插拔」有价值的前提：默认实现得足够好，替换实现才有意义。
+1. **保留尾部窗口**：默认最多 2000 行或 50KB（`DEFAULT_MAX_LINES` / `DEFAULT_MAX_BYTES`），以先到者为准；
+2. **落盘完整输出**：超出窗口的内容写入临时文件（`pi-bash-*`），结果里给出路径；
+3. **结构化结果限流**：`structuredContent.output` 最多 1MB（`STRUCTURED_OUTPUT_MAX_BYTES`），超出则标记 `truncated` 并给出完整文件路径。
 
-## 9.3 为什么「可替换的执行后端」是 pi 的命脉
+模型看到的是「尾部 + 截断说明」，而人类/程序仍能通过临时文件拿到完整输出。这比「直接截断、不告诉任何人」可靠得多。
 
-回到第 1、2 章反复强调的 pi 立场：**核心不内置权限系统，把约束外包给容器和可替换的执行后端。** `BashOperations` 就是这句话里「可替换的执行后端」的技术原型。
+`truncate.ts` 还提供了四种截断策略：
 
-把 `exec` 抽成接口，意味着同一个 `bash` 工具可以接不同的「后端」：
+| 函数 | 适用 |
+|---|---|
+| `truncateHead` | 保留开头（如文件头部） |
+| `truncateTail` | 保留结尾（如命令输出） |
+| `truncateMiddle` | 保留首尾（如长文件预览） |
+| `truncateLine` | 单行超长（grep 匹配行最多 500 字符） |
 
-| 后端实现 | 效果 | 用途 |
-|---|---|---|
-| `createLocalBashOperations`（默认） | 在本地 shell 跑 | 开发者本机直接用 |
-| 一个 SSH 实现 | 命令在远程机器跑 | 远程开发、跑在算力更强的机器上 |
-| 一个容器实现 | 命令在 Docker/沙箱里跑 | **安全隔离**——这是 pi「约束外包」的核心姿态 |
-| 一个 faux/mock 实现 | 返回预设输出，不真跑 | 测试整个工具链不产生副作用 |
+## 9.5 文件写入：按真实路径串行化
 
-注意第三行：pi 不在核心里写「禁止 `rm -rf`」这类规则，而是说——你担心安全？把 `BashOperations` 换成一个「在容器里跑」的实现，命令就被关进沙箱了，能不能 `rm -rf` 由容器的挂载和权限说了算，跟 pi 核心无关。**这就是「约束外包」：不在代码里做策略判断，而是把执行环境本身变成可替换的边界。** 第 10 章我们会专门展开这套哲学的代价与收益。
-
-`createLocalBashOperations` 的注释还点了一个巧妙用法：扩展可以拦截 `user_bash` 事件（用户用 `!` 前缀直接跑的命令），在**重写或包装命令之后**，仍然复用 pi 标准的本地执行行为——因为本地后端是个公开的、可被组合的函数，而不是藏在工具内部的私货。
-
-## 9.4 `withFileMutationQueue`：同文件写操作的串行化
-
-`bash` 解决的是「进程执行」的可插拔；而 `write`/`edit` 这类**改文件**的工具，面临的是另一个经典并发问题：**两个工具调用同时改同一个文件，会互相覆盖、产生竞态。**
-
-第 3 章讲过一道防线——工具可以声明 `executionMode: "sequential"` 让整批串行。但这有点「一刀切」：只要有一个写工具，整批（哪怕其余是无关的读操作）都得排队，太浪费并行度。pi 还有一道更精细的防线：`withFileMutationQueue`（`core/tools/file-mutation-queue.ts`），**按文件粒度**串行化写操作——同一个文件的修改排队，不同文件的修改照样并行：
+并行工具执行带来一个现实问题：两个 `edit` 同时改同一个文件，后写者会覆盖先写者。pi 的解法是 `withFileMutationQueue(path, fn)`：
 
 ```ts
-/**
- * Serialize file mutation operations targeting the same file.
- * Operations for different files still run in parallel.
- */
 export async function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
-	// ...按 key 维护一条 Promise 链，同 key 的 fn 依次执行
-}
-```
+	const registration = registrationQueue.then(async () => {
+		const key = await getMutationQueueKey(filePath);
+		const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
+		// 把本次操作挂到该 key 的 promise 链尾部
+		// ...
+	});
+	registrationQueue = registration.then(() => undefined, () => undefined);
 
-它的精巧在两处：
-
-**1. 用「真实路径」做队列 key，而非字符串路径。** 它先 `realpath` 解析路径再当 key：
-
-```ts
-async function getMutationQueueKey(filePath: string): Promise<string> {
-	const resolvedPath = resolve(filePath);
+	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+	await currentQueue;
 	try {
-		return await realpath(resolvedPath);   // 解析符号链接、规范化
-	} catch (error) {
-		if (isMissingPathError(error)) return resolvedPath;  // 文件还不存在（如新建）也要能排队
-		throw error;
+		return await fn();
+	} finally {
+		releaseNext();
+		if (fileMutationQueues.get(key) === chainedQueue) fileMutationQueues.delete(key);
 	}
 }
 ```
 
-为什么非要 `realpath`？因为 `./a.txt`、`a.txt`、一个指向同一文件的符号链接，是同一个物理文件的三种写法。只有解析成真实路径，才能保证「逻辑上的同一文件」落到同一个队列 key，真正避免竞态。而文件还不存在时（比如 `write` 新建），`realpath` 会失败，此时退回用规范化后的绝对路径当 key——新建也得排队，否则两个并发的「创建同一文件」也会打架。
+三个设计点：
 
-**2. 用 Promise 链实现无锁队列。** 每个 key 在 `fileMutationQueues` 这张 Map 里维护一条 Promise 链：新任务 `.then` 到当前链尾，执行完 `releaseNext()` 释放下一个。同 key 的任务严格依次执行，不同 key 的链彼此独立、天然并行。还有一个 `registrationQueue` 串行化「注册」这一步本身，避免两个任务同时读改 Map 造成 race。完成后若链尾还是自己就从 Map 删除 key，避免内存泄漏。
+- **key 用 `realpath`**：符号链接指向同一文件时，仍然共享同一把锁。
+- **不存在的文件用 `resolve` 后的路径**：新建文件还没有 realpath，但同一路径的创建也应串行。
+- **`registrationQueue` 串行化「建链」过程**：否则两个并发调用可能同时读到同一个 `currentQueue`，形成竞态。
 
-> 这一节和第 3 章的 `executionMode`、第 5 章 `AgentHarness` 的 phase 机串起来看，能看到 pi 处理「互斥」的一以贯之的审美：**不用锁、不用信号量，全用 Promise 链 / 状态字段 / 队列**这些 JS 原生、无死锁风险的手段，在不同粒度上（会话级、工具批级、单文件级）各自串行化。
+不同文件之间仍然并行——这是「细粒度锁」而不是「全局写锁」。
 
-至此，工具的三层我们全拆完了：第 8 章的「工具是什么」（AgentTool/ToolDefinition）、本章的「工具在哪做、怎么做安全」（Operations + 文件队列）。一个有意思的事实是——到这里为止，pi 核心**从未出现过「这个命令危险、拒绝执行」之类的判断**。它凭什么敢这样?下一章，我们正面回答 pi 最有争议、也最值得玩味的设计:「无权限」哲学。
+## 9.6 把后端换掉：容器、微 VM、远端
 
----
+因为 Operations 只是普通对象，替换后端不需要改工具代码：
 
-## 本章小结
+```ts
+const bash = createBashTool(cwd, {
+	operations: {
+		exec: async (command, cwd, { onData, signal, timeout }) => {
+			// 转发到容器 / SSH / 微 VM
+			return await myRemoteExec(command, { cwd, onData, signal, timeout });
+		},
+	},
+});
+```
 
-- `BashOperations` 把「执行命令」抽成一个只有 `exec` 的接口，工具只依赖接口，不关心命令在本地 / SSH / 容器 / mock 哪个后端跑——「机制与策略分离」在工具最底层的落地。
-- 默认实现 `createLocalBashOperations` 看似简单，实则封装了一整套工程：`detached` 进程组 + `killProcessTree` 杀整棵树、超时杀树、`track/untrackDetachedChildPid` 防僵尸、`waitForChildProcess` 防 hang、stdio 流式回调。
-- 可替换的执行后端是 pi「约束外包」的技术原型：要安全就把后端换成容器实现，让沙箱而非核心代码来约束命令——核心不做策略判断。
-- `withFileMutationQueue` 按「真实路径（`realpath`）」为 key、用 Promise 链无锁串行化同文件写操作，不同文件仍并行；比 `executionMode: "sequential"` 的「整批串行」精细得多。
-- pi 处理互斥的统一审美：不用锁，全用 Promise 链 / 状态字段 / 队列，在会话级、工具批级、单文件级各自串行化。
+pi 官方文档 `docs/containerization.md` 给出四种隔离路径：
 
-下一章，正面解读 pi 最有争议的设计——「无权限」哲学：核心为什么不内置准入控制，这样做的代价与收益各是什么。
+| 方式 | 边界 | 特点 |
+|---|---|---|
+| Plain Docker | 整个 Pi 进程 | 最简单，凭据需传入容器 |
+| Docker Sandboxes | 托管沙箱 | 代理持有真实凭据，容器内只看到替代值 |
+| OpenShell | 本地/远程沙箱 | 文件、进程、网络、凭据策略 |
+| Gondolin 扩展 | 微 VM | Pi 留在宿主机，内置工具与 `!` 命令进 VM |
+
+它们对应不同的信任模型：**你是在隔离「模型生成的命令」，还是在隔离「整个 Agent 进程」？** 这个问题的答案决定了凭据放哪、扩展在哪运行、文件如何共享。第 10 章会把这条思路扩展到「权限该放在哪一层」。
+
+## 9.7 Operations 的边界：不该放什么
+
+Operations 只负责「怎么执行」，不应该承担：
+
+- **权限判断**：那是 `beforeToolCall` / 扩展的职责；
+- **参数校验**：那是 schema 与 `prepareArguments` 的职责；
+- **结果格式化**：那是工具实现与 `content` / `structuredContent` 的职责；
+- **重试策略**：那是循环或 provider 层的职责。
+
+把这些混进 Operations，会导致「换后端就换了一套安全策略」——这是最危险的一种耦合。
 
 ---
 
@@ -164,13 +188,18 @@ async function getMutationQueueKey(filePath: string): Promise<string> {
 
 | 文件 | 作用 |
 |---|---|
-| `packages/coding-agent/src/core/tools/bash.ts` | `BashOperations` 接口、`createLocalBashOperations` 默认实现 |
-| `packages/coding-agent/src/utils/shell.ts` | `getShellConfig`/`getShellEnv`/`killProcessTree`/`track*DetachedChildPid` |
-| `packages/coding-agent/src/utils/child-process.ts` | `waitForChildProcess`（正确等待 detached 进程退出） |
-| `packages/coding-agent/src/core/tools/file-mutation-queue.ts` | `withFileMutationQueue`：按真实路径串行化同文件写操作 |
+| `packages/coding-agent/src/core/tools/bash.ts` | `BashOperations`、本地 shell 实现、超时与进程树 |
+| `packages/coding-agent/src/core/tools/powershell.ts` | Windows 后端（复用 `BashOperations` 契约） |
+| `packages/coding-agent/src/core/tools/output-accumulator.ts` | 尾部窗口、临时文件、完整输出 |
+| `packages/coding-agent/src/core/tools/truncate.ts` | 四种截断策略与默认上限 |
+| `packages/coding-agent/src/core/tools/file-mutation-queue.ts` | 按 realpath 串行化写入 |
+| `packages/coding-agent/src/core/tools/{read,edit,write,grep,find,ls}.ts` | 各自的 Operations 契约 |
+| `packages/coding-agent/docs/containerization.md` | Docker / OpenShell / Gondolin 接入 |
+| `packages/coding-agent/examples/extensions/gondolin/` | 微 VM 后端的真实样例 |
 
 ## 动手实验
 
-1. 读 `createLocalBashOperations`，找出「超时」和「用户 abort」两条路径最终都汇聚到哪个函数（提示：`killProcessTree`）。再想：如果把 `detached` 去掉、只 kill `child.pid`，跑一个 `sleep 100 &` 会发生什么？
-2. 设计一个最小的「远程 `BashOperations`」接口实现（伪代码即可）：`exec` 通过 SSH 把 `command` 发到远程、把远程 stdout 通过 `onData` 流回来。对照 9.3 的表格，说明为什么 `bash` 工具一行都不用改就能用上它。
-3. 用 `withFileMutationQueue` 同时发起「对 `a.txt` 的两次写」和「对 `b.txt` 的一次写」，加日志观察执行顺序：验证 a 的两次严格串行、而 b 与 a 并行。再把其中一个路径换成指向 `a.txt` 的符号链接，验证 `realpath` 让它仍然和 a 排进同一队列。
+1. 实现一个「内存文件系统」的 `WriteOperations` 与 `ReadOperations`，用它们构造 `write` / `read` 工具，跑一轮「写文件再读回来」的 Agent 循环。全程不碰磁盘。
+2. 用 `withFileMutationQueue` 并发写同一个文件 50 次，每次写入递增数字，验证最终内容没有丢失更新。再用不同路径（含符号链接）测试 key 的归一化。
+3. 跑一个输出 10 万行的命令，检查模型看到的内容、`details.truncation`、`fullOutputPath` 三者是否一致。
+4. 阅读 `docs/containerization.md` 的四种方式，为你的场景选择一种，并写出「凭据放在哪、扩展在哪运行、文件如何共享」三行答案。

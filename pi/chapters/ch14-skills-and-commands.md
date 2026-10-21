@@ -1,173 +1,273 @@
-# 第 14 章　Skill 与 Slash Command：不写代码也能扩展
+# 第 14 章　Skill、Slash Command 与提示词模板
 
-> 第 13 章的扩展要写 TypeScript——那是给工程师的。但「教会 Agent 干一件特定的事」常常不需要代码,只需要一段说明书。pi 为此留了两条「零代码」的扩展通道:Skill(技能)和 Prompt Template(提示词模板)。它们都只是一个 Markdown 文件。
+> 不是所有能力都需要写代码。有些能力，一段写得足够好的 Markdown 就够了。
 
-上一章的 Extension 系统威力巨大,但门槛也实在——你得会写代码、懂事件、理解 `ExtensionContext`。可现实里大量的「扩展需求」根本是知识性的:「碰到 React 组件就按我们团队的规范写」「部署流程是这五步」。这类需求的本质是**给模型注入一段领域知识或操作流程**,不该逼用户去写 jiti 扩展。pi 的答案是两种纯 Markdown 的轻量机制:**Skill** 和 **Prompt Template**。这一章把它们讲透,顺带厘清 pi 里「斜杠命令」到底有几种来源。
+第 13 章的扩展是「可执行代码」。但很多工作流的本质是**知识与步骤**，不是新工具：怎么审一个 PR、怎么迁移一版数据库、怎么按团队规范写 release note。为这些事写一个 TypeScript 工具，既重又不灵活。
+
+pi 为此提供了两个「纯文本能力」通道：
+
+- **Skill**：按需加载的完整操作手册，可以带脚本、参考资料、模板；
+- **Prompt Template**：把一段常用提示词变成带参数的 `/` 命令。
+
+再加上内置与扩展注册的命令，它们共同组成 pi 的 Slash Command 体系。
 
 ---
 
-## 14.1 Skill：一个带 frontmatter 的 `SKILL.md`
+## 14.1 三选一：扩展、Skill、模板
 
-一个 Skill 就是一个 `SKILL.md` 文件,顶部一段 YAML frontmatter 声明元信息,下面是 Markdown 正文(具体的指令/知识)。pi 解析它的结构定义在 `core/skills.ts`:
+先给一张决策表，避免「用错容器」：
 
-```ts
-export interface SkillFrontmatter {
-	name?: string;
-	description?: string;
-	"disable-model-invocation"?: boolean;
-	[key: string]: unknown;
-}
+| 需求 | 选择 | 原因 |
+|---|---|---|
+| 需要执行代码、注册工具/命令、监听事件 | Extension | 唯一能进入进程执行任意逻辑的通道 |
+| 需要一套较长的流程说明，可能附带脚本与资料 | Skill | 渐进式披露，不占常驻上下文 |
+| 只需要复用一段提示词，可能带参数 | Prompt Template | 最轻，展开后就是普通输入 |
+| 需要用户显式触发、不希望模型自动选用 | Skill + `disable-model-invocation` 或模板 | 两者都能变成显式命令 |
+
+一个常见误区是把 Skill 当成「更长的系统提示词」。不是。系统提示词每轮都在上下文里；Skill 只有名字和描述常驻，正文要等模型主动读取（或被 `/skill:name` 强制加载）。
+
+---
+
+## 14.2 Skill：一个目录 + 一份 `SKILL.md`
+
+### 最小结构
+
+```text
+pdf-tools/
+├── SKILL.md
+├── scripts/
+│   └── extract.sh
+├── references/
+│   └── formats.md
+└── assets/
+    └── template.json
 ```
 
-一个典型的 `SKILL.md` 长这样:
+`SKILL.md` 以 frontmatter 开头：
 
 ```markdown
 ---
-name: pdf-processing
-description: Extract text and tables from PDF files. Use when the user
-  asks to parse, read, or analyze a PDF document.
+name: pdf-tools
+description: Extract text and tables from PDF files. Use when reading, converting, or inspecting PDFs.
 ---
 
-# PDF 处理
+# PDF tools
 
-1. 用 `pdftotext` 提取纯文本……
-2. 表格用 `camelot` ……
-（这里是给模型看的详细操作说明）
+Read `references/formats.md` before converting a document. Run scripts relative to this skill directory.
 ```
 
-pi 对 frontmatter 的两个字段有**严格的校验**(对齐 Agent Skills 规范):
+`description` 不是给人看的摘要，而是**路由信号**：模型靠它判断「当前任务要不要加载这个 Skill」。所以它必须同时回答「做什么」和「什么时候用」。官方文档点名了反例：`Helps with PDFs` 提供不了任何路由信息。
 
-- **`name`**:只能 `a-z0-9-`、不超过 64 字符、不能以连字符开头/结尾、不能有连续连字符(`validateName`)。缺省时回退用父目录名。
-- **`description`**:**必填**、不超过 1024 字符(`validateDescription`)。缺了它,这个 Skill 直接不加载——`if (!frontmatter.description...) return { skill: null }`。
+### frontmatter 契约
 
-为什么 `description` 这么关键、宁可不加载也不能缺?因为它是**模型决定「要不要用这个 Skill」的唯一依据**。下一节就会看到,description 是唯一进系统提示词的内容——写不好,模型就永远不会在对的时机想起这个技能。
+pi 实现的是 [Agent Skills 规范](https://agentskills.io/specification)，支持字段：
 
-## 14.2 渐进式披露：description 进提示词，正文按需才读
+| 字段 | 作用 |
+|---|---|
+| `name` | 命令名与显示名 |
+| `description` | 给模型的路由描述 |
+| `license` | 许可证名称或文件 |
+| `compatibility` | 环境要求 |
+| `metadata` | 额外键值 |
+| `allowed-tools` | 实验性的预批准工具列表 |
+| `disable-model-invocation` | 从模型自动选择中隐藏 |
 
-这是 Skill 机制最精妙的设计,也是它和「把知识一股脑塞进系统提示词」的根本区别。看 `formatSkillsForPrompt` 如何把 Skill 注入系统提示词:
+几条硬校验（`skills.ts`）：
+
+- `name` 只能是小写字母、数字、连字符，不能以连字符开头/结尾或连续出现，最长 **64** 字符；
+- `description` 必填，最长 **1024** 字符；
+- `disable-model-invocation` 采用严格布尔判断：只有 `=== true` 才生效，写 `"true"` 字符串没用；
+- 格式错误或缺少 description 的 `SKILL.md` **不会加载**；
+- 重名时**先发现的胜出**，并产生一条警告。
+
+pi 不强制 `name` 与父目录名一致，但其他 Agent Skills 实现可能会，所以「保持一致」是可移植性的最佳实践。
+
+### 发现顺序
+
+`loadSkills()` 的默认来源顺序是：
+
+1. `~/.pi/agent/skills/`
+2. `<cwd>/.pi/skills/`
+3. `~/.agents/skills/`
+4. 从 cwd 向上直到仓库根的 `.agents/skills/`
+
+再加上 settings 里显式配置的 `skillPaths`、Pi Package 里的 skills、以及命令行指定的路径。目录是递归扫描的，任何包含 `SKILL.md` 的子目录都会被识别。
+
+最终以 **realpath 去重 + 先到先得** 合并。这意味着：用户级 Skill 可以覆盖同名项目级 Skill——这个优先级是刻意的，让个人习惯不被仓库绑架；但也意味着排查「为什么我改的 Skill 没生效」时，要先检查是不是被更高优先级的同名项挡住了。
+
+### 渐进式披露是怎么实现的
+
+启动时，`formatSkillsForPrompt()` 只把三样东西写进系统提示词：
+
+```xml
+<available_skills>
+  <skill>
+    <name>pdf-tools</name>
+    <description>Extract text and tables from PDF files. ...</description>
+    <location>/home/me/.pi/agent/skills/pdf-tools/SKILL.md</location>
+  </skill>
+</available_skills>
+```
+
+外加两条使用说明：
+
+- 任务匹配描述时，用 `read`（或 `bash`）读取该文件；
+- Skill 内部的相对路径，要相对**Skill 目录**解析，并在工具命令里使用绝对路径。
+
+正文、脚本、参考资料都不进上下文。这就是「渐进式披露」：常驻成本只有几十个 token，完整内容按需付费。
+
+注意 `formatSkillsForPrompt` 的第三个参数 `fileReadTool`：如果当前没有 `read` 工具但注册了 `bash`，提示会改成「用 bash 读取」；如果文件读取工具只能通过其他工具间接到达，则提示不点名任何工具。**提示词会跟着工具集合变形**，而不是假设某个工具一定存在。
+
+### 强制加载：`/skill:name`
+
+模型可能漏掉一个本该用的 Skill。此时可以显式触发：
+
+```text
+/skill:pdf-tools extract report.pdf
+```
+
+`AgentSession._expandSkillCommand()` 做的事很简单（[agent-session.ts:2177](file:///Users/heshaozhong/Code/pi/packages/coding-agent/src/core/agent-session.ts#L2177)）：
 
 ```ts
-const lines = [
-	"The following skills provide specialized instructions for specific tasks.",
-	"Use the read tool to load a skill's file when the task matches its description.",
-	"<available_skills>",
-];
-for (const skill of visibleSkills) {
-	lines.push("  <skill>");
-	lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-	lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-	lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);  // ← 只给路径,不给正文
-	lines.push("  </skill>");
-}
+const content = readFileSync(skill.filePath, "utf-8");
+const body = stripFrontmatter(content).trim();
+const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+return args ? `${skillBlock}\n\n${args}` : skillBlock;
 ```
 
-注意:**进系统提示词的只有 `name` + `description` + `location`(文件路径),Skill 的正文一个字都没进去。** 提示词里那句话点破了机制:「**Use the read tool to load a skill's file when the task matches its description.**」——当任务匹配某个 description 时,模型自己用 `read` 工具去读那个 `location` 路径,把正文加载进来。
+三个细节值得注意：
 
-这就是 **渐进式披露(progressive disclosure)**:
+1. **去掉 frontmatter**，只把正文交给模型；
+2. **显式告诉模型 baseDir**，否则它会把 `references/formats.md` 解析到 cwd；
+3. **把参数附在 Skill 后面**，而不是替换正文——参数是「这次的具体要求」，正文是「通用的做法」。
 
-1. **平时**:每个 Skill 只花掉「一行 description」的上下文预算。哪怕你装了 50 个 Skill,系统提示词也只多了 50 行简介。
-2. **需要时**:模型判断「这个任务匹配 pdf-processing 的描述」,才主动 `read` 那个文件,把完整指令拉进上下文。
+`disable-model-invocation: true` 的 Skill 不会出现在 `<available_skills>` 里，但 `/skill:name` 仍然可用。这正是「危险或高成本操作只允许人触发」的实现方式。
 
-> **给 Agent 开发者的启示**:Skill 机制的本质,是把「知识的索引」和「知识的正文」分离——索引(description)常驻、廉价、用于触发;正文(SKILL.md body)按需加载、昂贵、用于执行。这完美复用了 pi 已有的 `read` 工具,**没有为「加载技能」发明任何新机制**。模型本来就会读文件,Skill 不过是给了它一张「该读哪个文件」的菜单。这种「用已有原语拼出新能力」的克制,是优雅扩展系统的标志。
+是否把 Skill 注册成命令，还受 `enableSkillCommands` 设置控制；但即使关闭命令补全，手输 `/skill:name` 依然有效。
 
-`disable-model-invocation: true` 是这套机制的一个开关:置真的 Skill 会被 `formatSkillsForPrompt` 过滤掉(`filter((s) => !s.disableModelInvocation)`),即不进菜单、模型无从自动触发——它**只能被用户显式调用**(下一节的 `/skill:name`)。适合那些「我想手动点名才用、不希望模型自作主张」的技能。
+---
 
-## 14.3 Skill 的发现规则与冲突处理
+## 14.3 Prompt Template：把提示词变成命令
 
-`loadSkills` 从三处加载 Skill:**全局 `~/.pi/skills/`**、**项目 `./.pi/skills/`**、以及**显式配置的路径**。目录扫描规则(`loadSkillsFromDirInternal`)有讲究:
+### 一个文件就是一个命令
 
-- 一个目录里有 `SKILL.md`,就**把这个目录当作一个技能根,不再往下递归**——`SKILL.md` 同目录的其他文件被视为这个技能的资源(正文里可以相对引用)。
-- 没有 `SKILL.md` 的目录,则加载其下直接的 `.md` 文件各算一个技能,并继续递归子目录找 `SKILL.md`。
-- 尊重 `.gitignore`/`.ignore`/`.fdignore`,跳过 `node_modules` 和点开头的目录。
+`~/.pi/agent/prompts/review.md`：
 
-加载时还做两件「卫生」工作:
+```markdown
+---
+description: Review staged git changes
+argument-hint: "[focus]"
+---
+Review the staged changes. Focus on ${1:-correctness, security, and error handling}.
+```
 
-1. **符号链接去重**:用 `canonicalizePath`(realpath)算真实路径,同一个文件经由不同符号链接被发现多次时,只装一次。这和第 9 章 `withFileMutationQueue` 用 realpath 做 key 是同一种「逻辑同一性」思维。
-2. **同名冲突检测**:两个 Skill 重名时,**先加载的赢**,后来的产生一条 `collision` 诊断(不静默吞掉,让用户知道有冲突)。
+文件名决定命令名：这个文件就是 `/review`。`description` 出现在命令补全里；省略时取第一行非空文本。`argument-hint` 可选，用 `<尖括号>` 表示必填、`[方括号]` 表示可选。
 
-注意 Skill 正文里若引用相对路径,要相对 `SKILL.md` 所在目录(`baseDir`)解析——`formatSkillsForPrompt` 的提示词专门叮嘱了模型这一点。这让一个 Skill 可以是「一个目录」:`SKILL.md` + 配套脚本/模板/数据,自成一个可移植的能力包。
+### 参数替换
 
-## 14.4 三种斜杠命令：extension / prompt / skill
+模板支持一套 bash 风格的语法：
 
-用户在输入框敲 `/xxx`,在 pi 里可能命中**三种完全不同来源**的东西。`slash-commands.ts` 把来源类型枚举得很清楚:
+| 语法 | 含义 |
+|---|---|
+| `$1`, `$2`, … | 第 N 个位置参数 |
+| `$@` / `$ARGUMENTS` | 所有参数，空格连接 |
+| `${1:-default}` | 第一个参数，缺省用默认值 |
+| `${@:-default}` | 所有参数，为空时用默认值 |
+| `${@:N}` | 从第 N 个开始的所有参数 |
+| `${@:N:L}` | 从第 N 个开始的 L 个参数 |
+
+参数遵循 shell 风格引号：`/review "API compatibility"` 会得到一个含空格的参数，而不是两个。
+
+实现上有一个重要约束：**替换不会递归**。如果参数内容本身包含 `$1` 或 `$@`，它不会被再次展开。这避免了「用户输入被当成模板执行」的注入问题。
+
+### 展开发生在什么时候
+
+一次用户输入的完整处理顺序（`AgentSession`）：
+
+```text
+input 事件（扩展可改写/吞掉）
+  → 如果是扩展命令，直接交给扩展，不进入模型
+    → /skill:name 展开
+      → prompt template 展开
+        → 进入 steering / followUp / 正常 prompt 队列
+```
+
+注意扩展命令优先于模板：同名时，扩展的 `input` 处理器或注册命令会先拿到控制权。这也是「扩展是更强的通道」的体现。
+
+项目级模板放在 `.pi/prompts/`，同样要等项目信任通过才加载。
+
+---
+
+## 14.4 Slash Command 的三个来源
+
+`SlashCommandInfo.source` 只有三个值：
 
 ```ts
 export type SlashCommandSource = "extension" | "prompt" | "skill";
 ```
 
-再加上一组**内置命令**(`BUILTIN_SLASH_COMMANDS`:`/model`、`/compact`、`/fork`、`/tree`、`/resume`、`/new`、`/quit` ……),一共四类:
+| 来源 | 命名 | 执行方式 |
+|---|---|---|
+| 内置 | `/model`、`/tree`、`/compact`、`/reload` 等 | 由 CLI / TUI 直接处理 |
+| 扩展 | `pi.registerCommand(name, ...)` | 交给扩展 handler，不进入模型 |
+| 提示词模板 | 文件名，如 `/review` | 展开成文本，进入模型 |
+| Skill | `/skill:<name>` | 读取 `SKILL.md`，包成 `<skill>` 块进入模型 |
 
-| 斜杠命令 | 来源 | 本质 | 例 |
-|---|---|---|---|
-| 内置 | 核心硬编码 | 直接操作会话/UI | `/compact`(连第 12 章)、`/tree`(连第 11 章) |
-| 扩展命令 | `registerCommand`(第 13 章) | 跑一段扩展代码 | 任意自定义 |
-| Prompt 模板 | `~/.pi/prompts/*.md` | 展开成一段文本喂给模型 | `/review-pr` |
-| Skill 调用 | `/skill:name` | 注入某个 Skill 的正文 | `/skill:pdf-processing` |
+内置命令列表定义在 `slash-commands.ts`，包含会话管理（`new`/`resume`/`fork`/`tree`）、配置（`model`/`thinking`/`settings`）、维护（`compact`/`reload`/`export`）等。它们不是「特殊提示词」，而是真正的控制面操作。
 
-后两类是「零代码」的,正是本章的主角。它们都不执行代码,只是**把用户的一行 `/命令` 展开成一段要发给模型的文本**。
-
-## 14.5 Prompt Template：带参数替换的文本片段
-
-Prompt Template(`core/prompt-templates.ts`)是最简单的一种:`~/.pi/prompts/` 或 `./.pi/prompts/` 下的 `.md` 文件,文件名即命令名。用户敲 `/review-pr 123`,pi 就把 `review-pr.md` 的正文展开、替换掉里面的参数占位符,当作用户消息发出去。
-
-它的参数替换(`substituteArgs`)直接学 bash:
-
-```ts
-// $1, $2 ...        位置参数
-// $@ / $ARGUMENTS   全部参数
-// ${1:-default}     第1个参数,缺省时用 default
-// ${@:2}            从第2个起的所有参数
-// ${@:2:3}          从第2个起的3个参数
-```
-
-于是一个 `deploy.md` 模板可以写成:
-
-```markdown
----
-description: 部署到指定环境
-argument-hint: <env> [version]
----
-请把服务部署到 ${1:-staging} 环境,版本 ${2:-latest}。步骤:
-1. ……
-```
-
-`expandPromptTemplate` 在用户输入以 `/` 开头时匹配模板名、解析参数、做替换,**返回展开后的文本**——它不发给模型、不执行,只负责「把 `/deploy prod v2` 变成一段完整的指令文本」。Prompt 模板因此是「可复用的提问」:把你反复输入的长 prompt 存成文件,用一行斜杠命令唤起。
-
-## 14.6 Skill 调用：`/skill:name` 如何展开成 skill block
-
-Skill 除了「让模型自动 read」,也能被用户**显式调用**:`/skill:pdf-processing 把这个文件转成文本`。展开逻辑在 `agent-session.ts` 的 `_expandSkillCommand`:
-
-```ts
-private _expandSkillCommand(text: string): string {
-	if (!text.startsWith("/skill:")) return text;
-	const skillName = ...; const args = ...;
-	const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
-	if (!skill) return text;
-	const body = stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
-	const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\n` +
-		`References are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
-	return args ? `${skillBlock}\n\n${args}` : skillBlock;
-}
-```
-
-它把 Skill 正文包进一个 `<skill name=... location=...>...</skill>` 块,再把用户附带的话(args)接在后面,作为一条用户消息发出。和「自动触发」相比,显式调用是**强制注入**——不依赖模型判断,用户点名了就一定把正文塞进上下文。
-
-这个 `<skill>` 块还有 UI 上的呼应。`parseSkillBlock` 用正则把它解析回 `{name, location, content, userMessage}`,`SkillInvocationMessageComponent`(第 15 章的 TUI 组件)据此把它渲染成一个可折叠的 `[skill] 名字` 行——默认折叠(不让大段技能正文刷屏),按键展开看全文。**注入给模型的是全文,展示给用户的是一行**——这又是第 11 章「树里存全集、喂模型子集」那种「内容与呈现分层」思维在 UI 层的再现。
-
-至此,pi 的「扩展光谱」就完整了:重量级的代码扩展(第 13 章 Extension)、轻量级的知识扩展(本章 Skill)、最轻的文本扩展(本章 Prompt Template)。三者覆盖了从「我要改 Agent 行为」到「我只想存一段常用 prompt」的全部需求,且**没有一个需要改 pi 核心**。下一章我们转向另一个 pi 不肯将就的地方——它为什么放着成熟的终端 UI 库不用,要自研一套 `pi-tui`。
+一个值得注意的边界：**扩展命令不能被排队成 steering/follow-up**。`_queueUserInput` 里有一句 `_throwIfExtensionCommand(text)`——因为扩展命令是同步控制操作，把它塞进消息队列没有语义。Skill 与模板则可以，因为展开后就是普通用户文本。
 
 ---
 
-## 本章小结
+## 14.5 系统提示词：分区、增量与强制替换
 
-- Skill = 一个带 YAML frontmatter 的 `SKILL.md`;`name`(`a-z0-9-`、≤64)、`description`(必填、≤1024)被严格校验,缺 description 直接不加载——因为 description 是模型决定是否启用该技能的唯一依据。
-- 核心设计是**渐进式披露**:`formatSkillsForPrompt` 只把 name+description+location 注入 `<available_skills>`,正文不进;提示词指示模型「任务匹配 description 时用 `read` 工具加载 location」。50 个技能也只花 50 行预算,正文按需加载——复用已有 `read` 工具,不发明新机制。
-- Skill 从全局/项目/显式路径三处发现:含 `SKILL.md` 的目录即一个技能根(不再递归);用 realpath 去重、同名冲突「先到先得」并产出 collision 诊断;`disable-model-invocation` 让技能退出自动菜单、只能显式调用。
-- 斜杠命令有四类来源:内置(`/compact`/`/tree`...)、扩展命令(`registerCommand`)、Prompt 模板、`/skill:name`。后两类零代码,只把 `/命令` 展开成发给模型的文本。
-- Prompt Template 是 `.md` 文本片段 + bash 风格参数替换(`$1`/`$@`/`${1:-default}`/`${@:2:3}`),`expandPromptTemplate` 展开后当用户消息发出——「可复用的提问」。
-- `/skill:name` 经 `_expandSkillCommand` 把正文包成 `<skill>` 块强制注入(不依赖模型判断);UI 用 `parseSkillBlock` + `SkillInvocationMessageComponent` 渲染成可折叠的一行——注入全文、展示一行。
+Skill 能出现在提示词里，靠的是系统提示词的**分区结构**。
 
-下一章,看 pi 为什么要自研终端 UI 库 `pi-tui`。
+### 分区
+
+`buildSystemPromptSections()` 产出一个有序的 `Record<string, string>`：
+
+| 分区 | 内容 |
+|---|---|
+| `preamble` | 身份与总体职责（唯一不带 XML 标签的分区） |
+| `tools` | 当前声明给模型的工具及一句话说明 |
+| `rules` | 工具贡献的规则 + 全局规则 |
+| `docs` | pi 自身文档的位置索引 |
+| `addendum` | 用户 `APPEND_SYSTEM.md` 追加的内容 |
+| `project_context` | `AGENTS.md` 等项目指令 |
+| `skills` | `<available_skills>` 清单 |
+| `cwd` | 工作目录 |
+| 自定义 | 扩展通过 `sections` 注入的任意分区 |
+
+除 `preamble` 外，每个分区都会被包成同名 XML 标签。分区名必须匹配 `^[a-z][a-z0-9_-]*$`，且不能叫 `preamble`。
+
+这些分区最终成为转录里 `SystemMessage.sections` 的字段——这正是第 3 章「转录原生」的落点：提示词不是一个拼好的大字符串，而是**可独立替换的块**。
+
+### 增量更新
+
+`diffSystemPromptSections(previous, current)` 比较模型当前持有的分区与期望分区，只返回变化的键；被删除的分区值为 `null`。
+
+于是「加了一个 Skill」「切了一个工具」「cwd 变了」都只需要在转录里追加一个小的 `SystemMessage` 补丁，而不是重发整个系统提示词。这既省 token，也让 prompt caching 更有效。
+
+### 强制替换
+
+扩展在 `before_agent_start` 里可以返回 `systemPrompt` 或设置 `forceSystemPrompt`，把整个提示词换掉。此时：
+
+- `SystemMessage.content` 存放完整文本，`sections` 为空；
+- 转录仍然记录结构化的 sections（用于后续增量），但 provider 收到的是强制文本作为开头系统提示。
+
+这是一个「逃生舱」：能力强，但会失去分区带来的增量与可观测性，非必要不用。
+
+---
+
+## 14.6 实践建议
+
+1. **先问「这是知识还是代码」**。需要执行、需要状态、需要拦截事件 → 扩展；只是一套做法 → Skill；只是一段话 → 模板。
+2. **Skill 的 description 当路由规则写**。写清楚触发条件、输入形态、产出物；不要写成营销文案。
+3. **Skill 正文保持短，重内容放 `references/`**。模型是「按需读文件」，不是「一次性背完整本书」。
+4. **危险流程用 `disable-model-invocation: true`**。例如「发布到生产」「轮换密钥」，只允许人显式 `/skill:...`。
+5. **模板不要承载长流程**。超过一屏的步骤说明应该升级成 Skill，否则每次调用都重复占用上下文。
+6. **项目级资源永远假设不可信**。Skill 可以指示模型执行脚本，模板可以诱导模型泄露信息；项目信任只是加载闸，不是内容审查。
 
 ---
 
@@ -175,14 +275,16 @@ private _expandSkillCommand(text: string): string {
 
 | 文件 | 作用 |
 |---|---|
-| `packages/coding-agent/src/core/skills.ts` | `SkillFrontmatter`/`Skill`、`validateName`/`validateDescription`、`loadSkills`(发现/去重/冲突)、`formatSkillsForPrompt`(渐进式披露) |
-| `packages/coding-agent/src/core/prompt-templates.ts` | `loadPromptTemplates`、`substituteArgs`(bash 风格参数)、`expandPromptTemplate` |
-| `packages/coding-agent/src/core/slash-commands.ts` | `SlashCommandSource`(extension/prompt/skill)、`BUILTIN_SLASH_COMMANDS` |
-| `packages/coding-agent/src/core/agent-session.ts` | `parseSkillBlock`、`_expandSkillCommand`(`/skill:name` → `<skill>` 块) |
-| `packages/coding-agent/src/modes/interactive/components/skill-invocation-message.ts` | `SkillInvocationMessageComponent`:可折叠渲染 skill 块 |
+| `packages/coding-agent/src/core/skills.ts` | frontmatter 校验、发现与去重、`formatSkillsForPrompt` |
+| `packages/coding-agent/src/core/prompt-templates.ts` | 模板解析、bash 风格参数替换 |
+| `packages/coding-agent/src/core/slash-commands.ts` | 内置命令表、`SlashCommandSource` |
+| `packages/coding-agent/src/core/system-prompt.ts` | 分区构建、`diffSystemPromptSections`、强制提示词 |
+| `packages/coding-agent/src/core/agent-session.ts` | `/skill:name` 展开、模板展开、输入处理顺序 |
+| `packages/coding-agent/docs/skills.md` | 官方 Skill 指南 |
+| `packages/coding-agent/docs/prompt-templates.md` | 官方模板指南 |
 
 ## 动手实验
 
-1. 写一个最小 Skill:在 `./.pi/skills/hello/SKILL.md` 里放 frontmatter(`name: hello`、一句 `description`)+ 一段正文。启动 pi,确认系统提示词的 `<available_skills>` 里**只有** description 而没有正文。再问一个匹配 description 的问题,观察模型是否主动 `read` 了 `SKILL.md`——这就是渐进式披露。
-2. 故意把那个 Skill 的 `description` 删掉,重启,验证它**不再被加载**(对照 `loadSkillFromFile` 里 `return { skill: null }` 的分支)。再把 `name` 改成 `Hello_World`(含大写和下划线),看 `validateName` 产生了什么诊断。
-3. 写一个 Prompt 模板 `./.pi/prompts/commit.md`,正文用 `${1:-WIP}` 接收一个可选的提交信息。分别敲 `/commit` 和 `/commit "fix bug"`,对照 `substituteArgs` 解释两次展开出的文本差异。再对比:`/skill:name` 和 `/prompt` 展开后的去向有何不同(一个包成 `<skill>` 块、一个直接当文本)?
+1. 写一个带 `references/` 与脚本的 Skill，故意在正文里用相对路径引用脚本。分别用「模型自动加载」和 `/skill:name` 触发，观察模型是否正确解析 baseDir。
+2. 写一个模板，测试 `$1`、`${1:-default}`、`${@:2:2}` 与带引号参数，确认替换结果；再在参数里塞一个 `$1`，验证不会递归展开。
+3. 用 `disable-model-invocation: true` 隐藏一个 Skill，确认它不出现在 `<available_skills>` 中，但 `/skill:name` 仍能加载；然后打开 `enableSkillCommands: false`，观察命令补全与手动输入的区别。

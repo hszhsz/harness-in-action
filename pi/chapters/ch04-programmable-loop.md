@@ -1,186 +1,213 @@
-# 第 4 章　可编程的循环：钩子、队列与三种消息
+# 第 4 章　可编程的循环：钩子、队列与错误即数据
 
-> 一个好的内核，应该像一颗主板：自己不决定任何业务，但每一个引脚都能插上不同的策略。
+> 机制与策略的分界线，不在文档里，而在函数签名里。
 
-第 3 章我们看清了 `runLoop` 的机械结构——双层循环、turn 的五个步骤、串并行与停止语义。但你可能注意到一件事：`runLoop` 自己几乎不做任何「业务决策」。要不要换模型？要不要拦截某个工具？用户中途插的话怎么排队？这些它统统不管，而是委托给 `AgentLoopConfig` 上的一组钩子，以及上层对消息队列的编排。
-
-这一章，我们就来拆这套「可编程性」——它是 pi「机制与策略分离」哲学最直接的体现。
+第 3 章我们看到 `runLoop` 如何跑；这一章看它如何**被外部改写**。pi 把「循环该不该继续、消息何时插入、工具前后做点什么」全部抽成 `AgentLoopConfig` 上的钩子。读懂这些钩子的调用时机，你就读懂了大半个产品层。
 
 ---
 
-## 4.1 `AgentLoopConfig` 的九个钩子：机制与策略的分界线
+## 4.1 `AgentLoopConfig` 的十个钩子
 
-打开 `packages/agent/src/types.ts` 里的 `AgentLoopConfig`，你会看到一组可选回调。把它们集中看一遍，你就握住了「如何编程这个循环」的全部把手：
+`packages/agent/src/types.ts:193` 定义了配置。除去模型、工具执行模式等普通字段，真正参与控制流的有十个：
 
-| 钩子 | 触发时机 | 典型用途 |
+| 钩子 | 调用时机 | 能做什么 |
 |---|---|---|
-| `convertToLlm`（必填） | 每次请求前 | `AgentMessage[]` → provider `Message[]`，过滤掉 UI-only 消息 |
-| `transformContext` | `convertToLlm` 之前 | 上下文裁剪、外部上下文注入 |
-| `getApiKey` | 每轮请求前 | 解析会过期的短期 token（如 OAuth） |
-| `beforeToolCall` | 工具执行前 | **权限审批、危险操作拦截** |
-| `afterToolCall` | 工具执行后 | 结果加工、覆盖、注入终止信号 |
-| `prepareNextTurn` | 每个 turn 结束后 | 动态换模型、调推理强度、替换上下文 |
-| `shouldStopAfterTurn` | 每个 turn 结束后 | 宿主主动叫停（如上下文快满了） |
-| `getSteeringMessages` | 每轮迭代前 | 拉取用户中途插入的话 |
-| `getFollowUpMessages` | 内层循环退出后 | 拉取后续消息以开新一轮 |
+| `convertToLlm` | 每次请求前 | `AgentMessage[]` → LLM 可理解的 `Message[]`；过滤 UI 专用消息 |
+| `transformContext` | 每次请求前，早于 `convertToLlm` | 在 AgentMessage 层剪枝、注入外部上下文 |
+| `getApiKey` | 每次请求前 | 解析短期 token；每轮重新取，避免过期 |
+| `prepareNextTurn` | `turn_end` 之后、下一轮开始前 | 替换 context/model/thinkingLevel，注入准备消息（压缩、刷新提示词） |
+| `prepareRequest` | **每一次** provider 请求前（含首轮） | 最后一次改写 context/model/thinkingLevel |
+| `finishTurn` | 助手消息 + 工具结果都落盘后、`turn_end` 前 | 返回 `end` / `continue`，决定循环去向 |
+| `getSteeringMessages` | 每轮工具后、内层继续前 | 取「插话」消息 |
+| `getFollowUpMessages` | Agent 本来要停时 | 取「追加任务」消息 |
+| `beforeToolCall` | 参数校验后、执行前 | 准入：放行 / 阻止 / 建议终止整批 |
+| `afterToolCall` | 工具执行后、结果落盘前 | 按字段覆盖结果：content/details/isError/usage/terminate/structuredContent |
 
-这九个钩子有一个共同的契约，写在每个钩子的注释里：**「must not throw or reject」**——绝不能抛异常或返回 rejected promise，出错时要返回一个安全的回退值。原因很硬核：这些钩子被 `runLoop` 在精心编排的事件序列中调用，一旦抛异常，就会**绕过正常的事件序列**直接中断底层循环，让 UI 和会话状态陷入不一致。
+三个「准备类」钩子的分工最容易混淆，用一张时间线记住：
 
-> **设计要点**：`runLoop` 是「机制」（mechanism），这九个钩子是「策略」（policy）的注入点。机制稳定、策略灵活——这正是一个能长期演进的 Agent 内核应有的样子。你想让 pi「胆小」，就在 `beforeToolCall` 里加审批；想让它「省钱」，就在 `prepareNextTurn` 里把贵模型换成便宜模型。内核一行都不用改。
+```
+turn_end
+  └─ prepareNextTurn ── 可以换上下文/模型、注入 messages
+       └─ [写入 prepared + steering 消息]
+            └─ prepareRequest ── 每次请求前的最后改写
+                 └─ streamAssistantResponse
+                      └─ 工具执行（before/afterToolCall）
+                           └─ finishTurn ── end/continue
+                                └─ turn_end ── 回到顶部
+```
 
-我们重点看 `prepareNextTurn` 在 `runLoop` 里的真实用法（第 3 章见过它，这里展开）：
+### 4.1.1 `finishTurn`：不是「清理」，而是「调度决策」
+
+旧版的循环只根据「有没有工具调用 / 有没有队列消息」自然决定是否继续。1.3 增加了 `finishTurn`，让编排层显式表达意图：
+
+- `{ action: "end" }`：**硬退出**。不再轮询队列，直接 `agent_end`。
+- `{ action: "continue" }`：保证下一轮至少发一次 provider 请求。如果恰好有工具结果、steering 或 follow-up 要发送，这次请求会被它们「顺带满足」，不会多花一次调用。
+- `undefined`：保持默认调度。
+
+`AgentSession` 用它在 `turn_end` 边界派发扩展事件，并根据扩展是否要求继续来覆盖默认决策（第 5 章）。
+
+### 4.1.2 `prepareRequest`：面对「真实模型」的最后一道口子
+
+`prepareRequest` 与 `prepareNextTurn` 的区别不只是调用频率：
+
+- `prepareNextTurn` 是**回合级**的，适合做压缩、系统提示词刷新、模型切换。
+- `prepareRequest` 是**请求级**的，适合做虚拟模型路由、按请求注入 header、按当前上下文选择物理模型。
+
+`AgentSession` 正是在 `prepareRequest` 里做「会话树投影 + 虚拟模型解析 + 阈值压缩」这三件事。注意它拿到的是 `request.context`，但会用 `SessionManager.buildSessionProjection()` 重建一份规范上下文——因为 `agent.state.messages` 可能包含尚未投影的临时状态。
+
+### 4.1.3 `afterToolCall`：字段级覆盖，不做深合并
+
+返回值是 `AfterToolCallResult`，语义是「按字段替换」：
 
 ```ts
-const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-if (nextTurnSnapshot) {
-	currentContext = nextTurnSnapshot.context ?? currentContext;
-	config = {
-		...config,
-		model: nextTurnSnapshot.model ?? config.model,
-		reasoning:
-			nextTurnSnapshot.thinkingLevel === undefined
-				? config.reasoning
-				: nextTurnSnapshot.thinkingLevel === "off"
-					? undefined
-					: nextTurnSnapshot.thinkingLevel,
-	};
+{
+	content?: (TextContent | ImageContent)[];
+	details?: unknown;
+	structuredContent?: JsonValue;
+	isError?: boolean;
+	usage?: Usage;
+	terminate?: boolean;
 }
 ```
 
-注意 `config` 是用 `{ ...config, ... }` 重新赋值的——也就是说，**模型、推理强度、上下文都能在两个 turn 之间被热替换**，而循环本身浑然不觉。这是「动态降智/升智」「中途换模型」这类高级编排能力的底层支点。
+两个容易踩的坑：
 
-## 4.2 三种消息队列：steering / follow-up / next-turn 的语义差异
+1. 如果你返回了 `content` 但没有返回 `structuredContent`，原有的结构化结果会被**丢弃**——因为它可能已经与新的文本不一致。
+2. 没有深合并。`details` 要么整体替换，要么保持原样。
 
-pi 对「用户在 Agent 干活时插进来的消息」做了非常细致的区分。这不是过度设计——任何做过交互式 Agent 的人都知道，「什么时候让用户的话生效」是体验的关键。
+这种「宁可丢，也不拼」的策略，避免了扩展把两个不同来源的结果拼成一个自相矛盾的对象。
 
-三种消息，三种时机：
+## 4.2 队列：steering、follow-up 与消费时机
 
-| 消息类型 | 注入时机 | 语义 |
-|---|---|---|
-| **steering**（操舵） | 当前 turn 的工具执行完后、下一次模型生成前 | 「等等，调整一下方向」——尽快生效 |
-| **follow-up**（后续） | Agent 本要停下时 | 「等你忙完这个，再做这个」——排队等候 |
-| **next-turn**（下一轮） | 由上层在 idle 时注入会话 | 「下次启动时带上这条」——延迟到下次 |
-
-在 `runLoop` 里，steering 和 follow-up 的位置泾渭分明（回顾第 3 章的骨架）：steering 在内层循环每轮开头通过 `getSteeringMessages` 拉取并立即注入；follow-up 在内层循环**退出之后**通过 `getFollowUpMessages` 拉取，有就重新进内层。next-turn 则不属于 `runLoop` 的职责，而是 `AgentHarness` 在 idle 阶段把消息直接 append 进会话（第 5 章细说）。
-
-队列还有一个「排空模式」（`QueueMode`），定义在 `agent.ts` 的 `PendingMessageQueue` 里：
+`Agent` 内部有两个 `PendingMessageQueue`，默认模式都是 `"one-at-a-time"`：
 
 ```ts
-drain(): AgentMessage[] {
-	if (this.mode === "all") {
-		const drained = this.messages.slice();
-		this.messages = [];
+class PendingMessageQueue {
+	private messages: AgentMessage[] = [];
+	public mode: QueueMode;
+
+	peek(): AgentMessage[] {
+		if (this.mode === "all") return this.messages.slice();
+		const first = this.messages[0];
+		return first ? [first] : [];
+	}
+
+	drain(): AgentMessage[] {
+		const drained = this.peek();
+		this.messages = this.messages.slice(drained.length);
 		return drained;
 	}
-	// "one-at-a-time"：只取最老的一条
-	const first = this.messages[0];
-	if (!first) return [];
-	this.messages = this.messages.slice(1);
-	return [first];
 }
 ```
 
-- `"all"`：到了排空点，把队列里所有消息一次性注入。
-- `"one-at-a-time"`：每次只注入最老的一条，其余留到下一个排空点。
+`one-at-a-time` 的意义是**保序且可打断**：用户连续发三条消息，Agent 不会把三条一次性塞进同一轮，而是在每个可插入点消费一条，让模型有时间对第一条作出反应。
 
-`Agent` 类的默认值是 `"one-at-a-time"`（构造函数里 `options.steeringMode ?? "one-at-a-time"`）。为什么默认逐条？因为它让用户的多条插话能被模型逐一消化，而不是一股脑塞进去造成混乱。
+两者的语义差异：
 
-## 4.3 `beforeToolCall` / `afterToolCall`：在动手前后插一脚
+| 队列 | 消费点 | 典型用途 |
+|---|---|---|
+| steering | 工具批次结束后、下一次请求前 | 「先别改那个文件，先跑测试」 |
+| follow-up | 内层循环即将退出时 | 「做完这个，再把文档也更新了」 |
 
-这两个钩子值得单独拎出来，因为它们是 pi「约束外包」哲学的技术落点——**pi 核心不内置权限系统，但它在工具执行前后各留了一个口子，让上层把权限策略插进来。**
+`Agent` 还提供了 `peekQueuedMessages()`：steering 优先，其次 follow-up。UI 用它显示「下一条将发送什么」，但不会消费队列。
 
-回顾第 3 章 `prepareToolCall` 里 `beforeToolCall` 的位置：参数校验通过之后、真正执行之前。它的返回值能直接「掐断」执行：
+## 4.3 `Agent` 类：把循环包成对象
 
-```ts
-if (beforeResult?.block) {
-	return {
-		kind: "immediate",
-		result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
-		isError: true,
-	};
-}
-```
+`packages/agent/src/agent.ts` 的 `Agent` 是低层循环的有状态外壳。它解决三个问题：**状态归谁管、事件发给谁、并发如何约束**。
 
-注意拦截的结果不是抛异常，而是**合成一条「带错误内容的工具结果」喂回给模型**——模型会看到「这个操作被拦截了，原因是 XXX」，于是它可能换个做法。这又一次印证了「错误即数据」。
-
-`afterToolCall` 则在工具执行后、结果落地前给一次「修正机会」（`finalizeExecutedToolCall`）。它的合并语义是「字段级覆盖、不深合并」：
+### 4.3.1 状态初始化：系统提示词就是首条消息
 
 ```ts
-result = {
-	content: afterResult.content ?? result.content,
-	details: afterResult.details ?? result.details,
-	terminate: afterResult.terminate ?? result.terminate,
-};
-isError = afterResult.isError ?? isError;
-```
-
-典型用途：脱敏工具输出、给结果加注释、或者在某个工具成功后设 `terminate: true` 让循环停下。
-
-## 4.4 `Agent` 类与 `prompt` 队列模式：把循环包成对象
-
-`agent-loop.ts` 是函数式的、无状态的。但真实应用需要一个有状态的对象来「拥有」当前会话、管理队列、广播事件。这就是 `packages/agent/src/agent.ts` 里的 `Agent` 类（557 行）。
-
-它做的事可以归纳为三类：
-
-**1. 拥有状态。** `Agent` 持有 `_state`（系统提示词、模型、工具、消息、`isStreaming` 等）。这里有一个值得学的小设计——`tools` 和 `messages` 用 getter/setter 实现，赋值时自动 `.slice()` 复制顶层数组：
-
-```ts
-set messages(nextMessages: AgentMessage[]) {
-	messages = nextMessages.slice();
-}
-```
-
-这避免了「外部传进来一个数组，之后又在外面改它，结果污染了 Agent 内部状态」的经典 bug。
-
-**2. 管理队列与单飞约束。** `Agent` 内部有两个 `PendingMessageQueue`（steering 和 follow-up），并通过 `steer()` / `followUp()` 暴露入队接口。它还强制「同一时刻只能有一个 run」：
-
-```ts
-async prompt(...): Promise<void> {
-	if (this.activeRun) {
-		throw new Error(
-			"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
-		);
-	}
+function createMutableAgentState(initialState?: AgentInitialState): MutableAgentState {
+	let tools = initialState?.tools?.slice() ?? [];
+	let messages = initialState?.messages?.slice() ?? [];
+	const initialMessage = createInitialSystemMessage(
+		initialState?.systemPrompt,
+		tools.map(toToolDeclaration),
+	);
+	if (messages[0]?.role !== "system" && initialMessage) messages.unshift(initialMessage);
 	// ...
 }
 ```
 
-这条约束很关键：它把「正在跑的时候用户又发了消息」这个并发问题，强制收敛成「要么入队、要么等待」，而不是允许两个循环同时跑。
+`AgentInitialState.systemPrompt` 只是「种子」：它会被转换成一条 `SystemMessage` 放进 `messages`。之后读取 `state.systemPrompt` 时，是从转录里回放出来的（`getCurrentSystemPrompt(messages)`），而不是一个独立字段。这与第 3 章的转录原生模型完全一致。
 
-**3. 翻译事件、广播给监听者。** `processEvents` 把底层 `AgentEvent` 翻译成对内部状态的更新（比如 `tool_execution_start` 时把 toolCallId 加进 `pendingToolCalls`），然后**按订阅顺序 await 每个监听者**。注释特别强调：`agent_end` 是最后一个事件，但 Agent 要等到所有 `agent_end` 监听者都 settle 之后才真正变回 idle。这种「监听者也是 run 结算的一部分」的设计，保证了 UI 渲染、会话落盘这些副作用都完成后，才允许下一个 prompt 进来。
+### 4.3.2 一次运行的完整生命周期
 
-## 4.5 错误即数据：失败为什么不抛异常而编码进流
-
-最后收束一个贯穿前几章的主题。pi 在好几个层次上都坚持「失败不抛异常，而是编码成数据」：
-
-- **模型请求失败** → `StreamFn` 契约要求把失败编码进流，最终落成 `stopReason: "error"` 的 `AssistantMessage`（第 2 章）。
-- **工具执行失败** → 被 `createErrorToolResult` 包成正常工具结果喂回（第 3 章）。
-- **`beforeToolCall` 拦截** → 同样包成错误工具结果（本章 4.3）。
-- **整个 run 失败兜底** → `Agent.handleRunFailure` 合成一条 `stopReason` 为 `"error"`/`"aborted"` 的失败消息，并依次 emit `message_start` / `message_end` / `turn_end` / `agent_end`：
+`prompt()` 与 `continue()` 都走 `runWithLifecycle`：
 
 ```ts
-private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
-	const failureMessage = { /* ... stopReason: aborted ? "aborted" : "error" ... */ };
-	await this.processEvents({ type: "message_start", message: failureMessage });
-	await this.processEvents({ type: "message_end", message: failureMessage });
-	await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
-	await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	if (this.activeRun) throw new Error("Agent is already processing.");
+
+	const abortController = new AbortController();
+	// 建立 activeRun...
+	this._state.isStreaming = true;
+	this._state.errorMessage = undefined;
+
+	try {
+		await executor(abortController.signal);
+	} catch (error) {
+		await this.handleRunFailure(error, abortController.signal.aborted);
+	} finally {
+		this.finishRun();
+	}
 }
 ```
 
-为什么如此执着？因为对一个交互式 Agent 来说，**异常冒泡 = 事件序列断裂 = UI 卡死、会话不一致**。把失败建模成「一条正常的、只是 stopReason 不同的消息」，意味着所有下游消费者（UI、会话、扩展）都能用同一套代码路径处理成功和失败——它们甚至不需要写 try/catch。这是一个对「可观测性」极其友好的决策。
+`activeRun` 保证同一时刻只有一次运行；`abort()` 中止当前 controller；`waitForIdle()` 等待 `activeRun.promise`，而该 promise 只有在 `agent_end` 的所有监听器都结算后才 resolve。
 
----
+事件处理在 `processEvents`：先归约内部状态（`streamingMessage`、`pendingToolCalls`、`errorMessage`），再按订阅顺序**依次 await** 监听器。也就是说，一个慢的 UI 监听器会拖慢运行——这是有意的背压设计，而不是缺陷。
 
-## 本章小结
+### 4.3.3 `continue()` 的边界条件
 
-- `AgentLoopConfig` 的九个钩子是「策略」的注入点，共同契约是「绝不抛异常」；`prepareNextTurn` 能在 turn 之间热替换模型/上下文/推理强度。
-- 三种消息队列对应三种生效时机：steering（尽快）、follow-up（忙完再做）、next-turn（下次启动）；排空模式有 `"all"` 和 `"one-at-a-time"`，默认逐条。
-- `beforeToolCall` / `afterToolCall` 是「约束外包」的技术落点：前者能拦截执行、后者能修正结果，且都以「错误即数据」的方式工作。
-- `Agent` 类给无状态的循环套上「拥有状态、管理队列、单飞约束、广播事件」的外壳；getter/setter 复制数组、`activeRun` 强制串行是两处值得借鉴的细节。
-- pi 在四个层次坚持「失败编码成数据而非异常」，换来一个永不断裂的事件序列和极简的下游处理逻辑。
+`continue()` 不是「再跑一次」的万能按钮。它要求：
 
-下一章，我们再上升一层，看 `AgentHarness` 如何把这个「可编程的循环」编排成「会话、阶段、压缩、Skill」俱全的完整任务流程。
+- 当前没有运行；
+- 最后一条消息不是 `assistant`（除非队列里有 steering / follow-up，可以借机消费）。
+
+如果最后一条是 assistant 且队列为空，它会抛出 `Cannot continue from message role: assistant`。这是为了守住 provider 的协议约束：下一轮必须以 user 或 toolResult 结尾。
+
+## 4.4 错误即数据：三层兜底
+
+pi 的错误哲学可以概括为：**能在数据类型里表达的，就不要用异常表达。** 具体分三层：
+
+### 第一层：模型流
+
+`StreamFn` 的契约要求「不要 throw」，失败要编码成流事件，最终产出 `stopReason: "error" | "aborted"` 的 `AssistantMessage`。这样循环永远能拿到一条完整的消息，继续走 `finishTurn` / `turn_end` / `agent_end` 的正常路径。
+
+### 第二层：工具
+
+工具执行失败有两种表达：
+
+- 抛异常 → 被 `executePreparedToolCall` 捕获，转换成 `createErrorToolResult(message)`；
+- 返回 `{ isError: true }` → 保留 `details` 与 `structuredContent`，同时让模型看到错误文本。
+
+后者更好，因为 UI 和程序化调用方仍然能拿到结构化信息。pi 在类型注释里明确要求：**不要只在 `content` 里描述失败，要用 `isError` 标记。**
+
+### 第三层：运行器
+
+如果 `executor` 本身抛了未捕获异常，`handleRunFailure` 会合成一条 assistant 错误消息，并补齐完整的事件序列：
+
+```ts
+await this.processEvents({ type: "message_start", message: failureMessage });
+await this.processEvents({ type: "message_end", message: failureMessage });
+await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
+await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+```
+
+这样 UI 不会卡在「流式输出中」，扩展也能收到 `agent_end` 做清理。**异常被降级成一条消息，但生命周期仍然完整。**
+
+## 4.5 何时用 `Agent`，何时直接用循环
+
+| 场景 | 选择 |
+|---|---|
+| 嵌入式 Agent、需要自己管理消息与队列 | `Agent` |
+| 一次性脚本、已有事件总线 | `runAgentLoop` |
+| 需要完全自定义生命周期 | 直接用 `runLoop`（需要复制或 fork） |
+| 产品级会话（压缩、重试、扩展、持久化） | 不要直接用 `Agent`，用 `AgentSession` |
+
+`Agent` 是「可用的最小内核」，不是「产品」。它不负责持久化、不负责压缩、不负责扩展——这些都在 `pi-coding-agent` 的 `AgentSession` 里。下一章我们就进入那一层。
 
 ---
 
@@ -188,12 +215,14 @@ private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> 
 
 | 文件 | 作用 |
 |---|---|
-| `packages/agent/src/types.ts` | `AgentLoopConfig` 九钩子、`QueueMode`、`AfterToolCallResult` 等契约 |
-| `packages/agent/src/agent.ts` | `Agent` 类、`PendingMessageQueue`、`handleRunFailure` 兜底 |
-| `packages/agent/src/agent-loop.ts` | 钩子的真实调用点（`prepareToolCall`、`finalizeExecutedToolCall`） |
+| `packages/agent/src/agent.ts` | `Agent` 状态机、队列、事件分发、失败兜底 |
+| `packages/agent/src/types.ts` | 十个钩子与结果类型 |
+| `packages/agent/src/proxy.ts` | 把 `StreamFn` 代理到远端的最小例子 |
+| `packages/coding-agent/src/core/agent-session.ts` | 钩子最复杂的真实使用者 |
 
 ## 动手实验
 
-1. 给一个 `Agent` 实例注册一个 `beforeToolCall`，对所有 `bash` 工具调用返回 `{ block: true, reason: "演示拦截" }`。观察模型收到错误结果后的反应——它会道歉、换工具、还是放弃？这就是「约束外包」最小可用的样子。
-2. 把 `Agent` 的 `steeringMode` 分别设为 `"all"` 和 `"one-at-a-time"`，在一次长任务里连续 `steer()` 三条消息，对比两种模式下消息进入上下文的节奏差异。
-3. 阅读 `prepareNextTurn` 的合并逻辑，思考：如果你想实现「前 3 个 turn 用便宜模型，第 4 个 turn 起换贵模型」，你会在这个钩子里读什么状态来做判断？（提示：钩子的 context 里有 `newMessages`。）
+1. 用 `Agent` 起一个不联网的会话：注入一个 `streamFn`，第一次返回带 `toolCall` 的 assistant 消息，第二次返回纯文本。在 `subscribe` 里打印事件顺序，确认 `turn_end` 与 `agent_end` 的位置。
+2. 在运行中调用 `steer()` 与 `followUp()` 各一次，观察它们分别在什么事件之后被消费。把 `steeringMode` 改成 `"all"` 再试一次，对比差异。
+3. 写一个 `beforeToolCall`，对名字为 `bash` 的调用返回 `{ block: true, reason: "blocked by policy" }`。确认模型收到的是错误工具结果，而不是进程崩溃。
+4. 故意让 `streamFn` 抛异常，观察 `handleRunFailure` 合成的事件序列是否仍然以 `agent_end` 收尾。

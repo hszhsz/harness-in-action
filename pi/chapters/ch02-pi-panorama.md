@@ -1,105 +1,147 @@
-# 第 2 章　pi 全景：四个包如何各司其职
+# 第 2 章　pi 全景：十一个 workspace，三条接缝
 
-> 一个好的 monorepo 结构，本身就是一份架构文档。
+> 一个好的 monorepo 结构，本身就是一份架构文档。但当仓库长大时，先要确认你读的是哪一版「文档」。
 
-上一章我们建立了「Agent = Model + Harness」的认知框架，并点明 pi 的独特立场——把约束外包、核心保持精简。这一章，我们把镜头拉到最高处，俯瞰 pi 的整体结构：四个包分别是什么、为什么这样切、它们之间最关键的那条接缝在哪里。理解了这张全景图，后面每一章你都能知道「自己现在站在系统的哪个位置」。
+上一版电子书写道：pi 是一个 pnpm monorepo，由四个包组成。这个描述在 0.79 时代成立，但在 1.3 已经过时。今天 pi 的 `packages/` 下有 **11 个 workspace**，使用 **npm workspaces + `package-lock.json`** 管理，所有包版本统一为 `1.3.0`。本章先把这张地图画准，再抽出贯穿全书的三个接缝。
 
 ---
 
-## 2.1 monorepo 结构：四个包，四种职责
+## 2.1 从四个包到十一个 workspace
 
-pi 是一个 pnpm monorepo，`packages/` 下只有四个包。它们的职责切得非常干净：
-
-| 包 | npm 名 | 职责 | 一句话定位 |
+| 目录 | npm 包名 | 职责 | 一句话定位 |
 |---|---|---|---|
-| `packages/ai` | `@earendil-works/pi-ai` | 多 Provider LLM 抽象 | 「怎么跟模型说话」 |
-| `packages/agent` | `@earendil-works/pi-agent-core` | Agent 运行时与 Harness 子系统 | 「怎么把对话变成自主任务」 |
-| `packages/coding-agent` | `@earendil-works/pi-coding-agent` | 编码 Agent CLI、内置工具、扩展系统 | 「怎么把内核变成一个能用的编码助手」 |
-| `packages/tui` | `@earendil-works/pi-tui` | 自研终端 UI | 「怎么把这一切显示给人看」 |
+| `packages/ai` | `@earendil-works/pi-ai` | 多 Provider LLM 运行时、模型目录、认证、流协议 | 「怎么跟模型说话」 |
+| `packages/agent` | `@earendil-works/pi-agent-core` | Agent 循环、`Agent` 状态机、工具执行管线 | 「怎么把对话跑成任务」 |
+| `packages/coding-agent` | `@earendil-works/pi-coding-agent` | 会话编排、工具、扩展、CLI / RPC / SDK | 「怎么变成一个产品」 |
+| `packages/tui` | `@earendil-works/pi-tui` | 自研终端 UI、差分渲染、组件库 | 「怎么显示给人看」 |
+| `packages/codemode` | `@earendil-works/pi-codemode` | QuickJS WASM 代码执行沙箱 | 「用写代码代替逐个调工具」 |
+| `packages/mcp` | `@earendil-works/pi-mcp` | MCP 协议客户端（stdio / HTTP / OAuth） | 「接入外部工具生态」 |
+| `packages/durable` | `@earendil-works/pi-durable` | 先提交后展示的持久化 Agent 运行时（实验） | 「进程挂了也能接着跑」 |
+| `packages/chord` | `@earendil-works/chord` | 可热重载对象、契约、复制状态、RPC | 「跨进程的有状态对象」 |
+| `packages/env` | `@earendil-works/pi-env` | SSH 远端执行环境 + Rust daemon | 「把工具执行搬到另一台机器」 |
+| `packages/telemetry` | `@earendil-works/pi-telemetry` | 厂商中立的遥测契约与适配器 | 「可观测性不绑定后端」 |
+| `packages/evals` | `@earendil-works/pi-evals`（private） | 评测与文档一致性测试 | 「用真实任务验收 Agent」 |
 
-这四个包的依赖关系是单向的、分层的：
+根 README 只列出了其中 7 个面向外部用户的包；`mcp`、`codemode` 是 `coding-agent` 的实现依赖，`env` 服务于 `durable`，`evals` 是私有评测工程。**读源码时不要被根 README 的表格限制**。
+
+依赖关系（箭头表示「前者依赖后者」）：
 
 ```
-pi-tui  ←──────────────┐
-                        │
-pi-ai  ←──  pi-agent-core  ←──  pi-coding-agent  ──→  pi-tui
-（模型层）    （内核层）         （应用层）          （UI 层）
+telemetry ←── ai ←── agent ←── coding-agent ──→ tui
+     ↑                          ├──→ codemode
+     │                          └──→ mcp
+     ├── chord ←── durable ←── env
+     └──────────────┘
 ```
 
-- `pi-ai` 在最底层，不依赖任何其他 pi 包。它只关心「如何把一次请求发给 Anthropic / OpenAI / Google，并把响应变成统一的流」。
-- `pi-agent-core` 依赖 `pi-ai` 的**类型**，但**不依赖它的具体实现**——这是全书最重要的一条接缝，下一节细说。
-- `pi-coding-agent` 是应用层，它把内核、工具、扩展、会话、配置组装成一个真正能跑的 CLI，并依赖 `pi-tui` 来渲染界面。
-- `pi-tui` 是一个独立的、自研的终端 UI 库（不用 React/ink），任何包都能用它，但它不反向依赖业务逻辑。
+几个容易误判的点：
 
-> **给 Agent 开发者的启示**：很多 Agent 项目一开始就把「调模型」「跑循环」「画界面」糊在一个文件里。pi 用四个包强制划出了边界。这种边界不是洁癖，而是**可测试性**和**可复用性**的前提——你可以单独测 `pi-agent-core` 而完全不联网，因为它根本不知道真实的模型长什么样。
+- `pi-agent-core` 只依赖 `pi-ai` 的类型与少量工具函数，**不依赖任何 provider 实现**，也不依赖 `coding-agent`。
+- `pi-coding-agent` 是唯一的「组装厂」：模型运行时、工具、会话、扩展、TUI 都在这里汇合。
+- `durable` 不复用 `coding-agent`，它有自己的 harness、会话和工具抽象；`env` 只服务 `durable`。**不要把 `durable` 当成「新版 AgentSession」**，这是两条独立的产品线，第 17 章会讲。
 
-## 2.2 一条最关键的接缝：`streamSimple` 注入与 provider 无关
+> **给 Agent 开发者的启示**：包的数量不是重点，重点是**依赖方向是否允许你替换任意一层**。pi 的切法保证了：模型层不知道会话，内核不知道存储，UI 不知道业务。你可以只拿走 `pi-ai` 做网关，也可以只拿走 `pi-agent-core` 做嵌入式循环。
 
-如果整本书只让你记住一个设计，请记住这一个：**`pi-agent-core` 不依赖任何具体的模型实现，它只依赖一个函数签名。**
+## 2.2 接缝一：`StreamFn` —— 内核与模型的边界
 
-打开 `packages/agent/src/types.ts` 开头，你会看到 Agent 循环要求的那个核心契约：
+如果整本书只让你记住一个设计，请记住这个：**Agent 循环不依赖 `Models`，只依赖一个函数签名。**
+
+`packages/agent/src/types.ts:33`：
 
 ```ts
-import type {
-	// ...
-	SimpleStreamOptions,
-	streamSimple,
-} from "@earendil-works/pi-ai";
-
-/**
- * Stream function used by the agent loop.
- *
- * Contract:
- * - Must not throw or return a rejected promise for request/model/runtime failures.
- * - Must return an AssistantMessageEventStream.
- * - Failures must be encoded in the returned stream via protocol events and a
- *   final AssistantMessage with stopReason "error" or "aborted" and errorMessage.
- */
 export type StreamFn = (
-	...args: Parameters<typeof streamSimple>
-) => ReturnType<typeof streamSimple> | Promise<ReturnType<typeof streamSimple>>;
+	model: Model<Api>,
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 ```
 
-注意这里的精妙：`StreamFn` 的类型直接「借用」了 `pi-ai` 的 `streamSimple` 函数的参数和返回值类型（`Parameters<>` / `ReturnType<>`），但 Agent 循环**真正运行时并不强制使用那个实现**。在 `agent-loop.ts` 里，每次需要调模型时是这样写的：
+相比旧版，这里有两个重要变化：
+
+1. **不再用 `Parameters<typeof streamSimple>`「借用」类型**。`StreamFn` 是显式声明的独立契约，`pi-agent-core` 因此可以彻底不依赖具体门面函数。
+2. **第二个参数是 `TranscriptContext`，而不是旧的 `Context`**。这是 1.3 最核心的架构变化：系统提示词和工具声明不再是 `Context.systemPrompt` / `Context.tools` 这样的旁路字段，而是作为 `SystemMessage` 存在于 `messages` 转录中。`normalizeContext()` 是唯一能构造 `TranscriptContext` 的入口，防止未归一化的上下文流入 provider。
+
+那么默认实现从哪来？`packages/agent/src/stream-fn.ts` 只有一个模块级变量：
 
 ```ts
-const streamFunction = streamFn || streamSimple;
+let defaultStreamFn: StreamFn | undefined;
+
+export function setDefaultStreamFn(streamFn: StreamFn | undefined): void {
+	defaultStreamFn = streamFn;
+}
+
+export function getDefaultStreamFn(): StreamFn {
+	if (!defaultStreamFn) {
+		throw new Error("No default stream function configured. Pass streamFn explicitly or call setDefaultStreamFn().");
+	}
+	return defaultStreamFn;
+}
 ```
 
-也就是说，调用方可以传入任何一个**符合 `StreamFn` 契约**的函数来替换真实的模型调用。这条接缝带来三个直接好处：
+宿主（`pi-coding-agent` 或你自己的应用）在启动时把 `Models` 的流函数装进去；内核在调用方没传 `streamFn` 时使用它。这条接缝带来三个直接好处：
 
 | 好处 | 含义 |
 |---|---|
-| **provider 无关** | 内核不知道 Anthropic 还是 OpenAI，只知道「有人会给我一个能吐事件流的函数」 |
-| **可测试** | 测试时注入一个返回预设事件流的假 `streamFn`，整个循环逻辑不联网、不烧 token 就能测 |
-| **可远程化** | 模型调用可以被代理、被缓存、被重路由，内核完全无感 |
+| **provider 无关** | 内核不知道 Anthropic 还是 OpenAI，只知道「有人会给我一个异步事件流」 |
+| **可测试** | 注入 `faux` provider 的流函数，整个循环不联网、不烧 token |
+| **可远程化** | `packages/agent/src/proxy.ts` 就是一个把模型调用转发到服务端的 `StreamFn`，内核无感 |
 
-而那句注释里的契约更值得反复读：**「Must not throw ... Failures must be encoded in the returned stream」**——失败不许抛异常，必须编码进返回的流里，最终落成一个 `stopReason: "error"` 的消息。这是 pi 整个错误处理哲学的源头，我们在第 4 章会专门讲「错误即数据」。
+契约里还有一句必须背下来的话：**失败不许抛异常，必须编码进返回的流**，最终落成 `stopReason: "error"` 或 `"aborted"` 的 `AssistantMessage`。这是 pi 错误处理哲学的源头，第 4 章展开。
 
-## 2.3 设计红线：核心精简、约束外包、状态用 JSONL 树
+## 2.3 接缝二：`AgentTool.execute` —— 内核与工具的边界
 
-俯瞰完结构，我们把 pi 的几条「工程红线」提炼出来。这些原则在后面每一章都会反复印证：
+内核不认识「读文件」「跑 shell」，只认识 `AgentTool`：
 
-1. **核心精简（lean core）**。`pi-agent-core` 只做机制，不做策略。它不知道什么是「危险命令」，不内置任何工具，甚至不知道会话要存到哪。所有这些都通过参数、钩子、注入交给上层。
+```ts
+export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
+	label: string;
+	prepareArguments?: (args: unknown) => Static<TParameters>;
+	outputSchema?: TSchema;
+	execute: (
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails>,
+	) => Promise<AgentToolResult<TDetails>>;
+	replay?: "never" | "safe";
+	executionMode?: ToolExecutionMode;
+}
+```
 
-2. **约束外包（outsourced constraints）**。如第 1 章所述，pi 核心不内置权限系统。准入控制通过 `beforeToolCall` 钩子和扩展的 `tool_call` 事件实现，沙箱通过容器和可替换的工具执行后端（Operations）实现。
+一个工具只承诺四件事：参数 schema、执行函数、流式更新回调、结果形状。至于「参数从哪来」「结果怎么渲染」「执行后端是本地还是容器」，内核一概不管。`coding-agent` 在这一层之上又包了一层 `ToolDefinition`，增加了暴露策略、系统提示词片段、自定义渲染等产品化字段（第 8 章）。
 
-3. **状态用 JSONL 树（session as a tree）**。pi 不用 SQLite，会话被建模成一棵 append-only 的 JSONL 树：每条消息、每次模型切换、每次压缩，都是树上的一个节点；「当前对话」是从某个叶子（leaf）回溯到根的一条路径。这让分支、回溯、压缩都变成了树操作。详见第 11 章。
+## 2.4 接缝三：`SessionManager` —— 编排与存储的边界
 
-4. **错误即数据（errors as data）**。模型请求失败、工具执行失败，都不以异常的形式冒泡打断循环，而是被建模成正常的消息或工具结果，喂回给模型或交给上层决策。
+`AgentSession` 不自己写文件，它持有一个 `SessionManager`。`SessionManager` 暴露的都是领域操作，而不是 `read/write`：
 
-5. **事件驱动观测（event-driven observability）**。循环内部的一切都通过 `AgentEvent` / 扩展事件以流的形式暴露，UI、日志、扩展都只是这些事件的消费者。
+```ts
+appendMessage(message)
+appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage)
+appendBranchSummary(...)
+appendContextEdit(targetId, replacement)
+branch(fromId)
+getBranch(fromId?)
+buildSessionProjection()
+```
 
-## 2.4 如何高效阅读这套代码
+因此「会话存 JSONL 还是数据库」「压缩摘要长什么样」「分支如何复制」都可以独立演进，而编排层只面对「追加条目 + 投影出上下文」这两个动作。第 11 章会看到，这套抽象如何让**压缩**和**回溯**变成同一棵树上的两种操作。
 
-pi 的代码量不小，但有几个「抓手」能让你快速上手：
+## 2.5 四条设计红线
 
-- **从 `packages/agent/src/index.ts` 看公共 API 表**。这个文件把 `pi-agent-core` 对外导出的所有东西列了一遍——`agent.ts`、`agent-loop.ts`、`harness/*`——相当于一张「内核功能目录」。
-- **从 `types.ts` 入手而非实现**。pi 的类型文件注释极其详尽（很多注释本身就是设计文档，比如上一节那段 `StreamFn` 契约）。先读类型，再读实现，事半功倍。
-- **`AGENTS.md` 是给「开发 pi 的人」（包括 Agent 自己）的规范**。pi 用自己来开发自己（dogfooding），所以这个文件既是人类贡献者的规范，也是 pi 跑在自己仓库里时读到的项目说明。提交信息遵循 `{feat,fix,docs}[(scope)]: msg` 格式——你在 `git log` 里能直接看到这种风格。
-- **善用 `faux` provider**。`packages/ai/src/providers/faux.ts` 是一个假的模型实现，专门用于测试。想理解「一次模型调用进出的数据长什么样」，读它比读真实 provider 更快。
+1. **核心精简（lean core）**。`pi-agent-core` 只做机制：循环、队列、工具管线、事件。它不内置工具，不知道权限，不知道会话文件。
+2. **约束外包（outsourced constraints）**。准入通过 `beforeToolCall` 与扩展的 `tool_call` 事件；隔离通过容器、沙箱、项目信任。核心只提供挂点。
+3. **转录即状态（transcript as state）**。系统提示词、工具增删、上下文编辑都是转录上的事件，而不是外部可变配置。这样「模型看到的」与「会话记录的」天然一致，重放才可靠。
+4. **错误即数据（errors as data）**。模型失败、工具失败都变成消息或结果，继续参与循环，而不是用异常炸掉整条链路。
 
-读代码的顺序，本书已经替你排好了：接下来的第二部分，我们直接推开内核的大门，看那颗心脏——`runLoop`——是如何第一次跳动的。
+## 2.6 如何高效阅读这套代码
+
+- **先读类型，再读实现**。`packages/agent/src/types.ts` 与 `packages/ai/src/types.ts` 的注释本身就是设计文档。
+- **抓入口**：`packages/coding-agent/src/main.ts` 负责模式解析与运行时装配；`core/agent-session.ts` 是真正的「产品大脑」。
+- **抓最小闭环**：`agent-loop.ts` 的 `runLoop` + `agent.ts` 的 `Agent` + `stream-fn.ts`，三份文件就能跑通一个不依赖 provider 的 Agent。
+- **用 `faux` 验证理解**：`packages/ai/src/providers/faux.ts` 是确定性模型，适合观察请求/响应的真实数据形态。
+- **读文档目录**：`packages/coding-agent/docs/` 有 40 余篇面向使用者的文档，`how-pi-works.md`、`session-format.md`、`compaction.md` 与源码高度对应。
+
+下一章，我们推开内核的门，看 `runLoop` 如何第一次跳动。
 
 ---
 
@@ -107,14 +149,17 @@ pi 的代码量不小，但有几个「抓手」能让你快速上手：
 
 | 文件 | 作用 |
 |---|---|
-| `packages/{ai,agent,coding-agent,tui}/` | 四个包，对应模型层 / 内核层 / 应用层 / UI 层 |
-| `packages/agent/src/types.ts` | `StreamFn` 契约——内核与模型解耦的接缝 |
-| `packages/agent/src/index.ts` | `pi-agent-core` 公共 API 目录 |
-| `packages/ai/src/stream.ts` | `streamSimple` 等门面函数的真实实现 |
-| `packages/ai/src/providers/faux.ts` | 测试用假 provider，理解数据形态的捷径 |
-| `AGENTS.md` | 开发规范，dogfooding 的证据 |
+| `packages/agent/src/types.ts` | `StreamFn`、`AgentLoopConfig`、`AgentTool` 等核心契约 |
+| `packages/agent/src/stream-fn.ts` | 默认流函数的注入点 |
+| `packages/agent/src/index.ts` | `pi-agent-core` 公共 API |
+| `packages/ai/src/models.ts` | `createModels` / `Models` / `Provider` |
+| `packages/coding-agent/src/core/agent-session.ts` | 产品级编排层 |
+| `packages/coding-agent/src/core/session-manager.ts` | 会话树与投影 |
+| `packages/coding-agent/docs/how-pi-works.md` | 官方架构说明，可与本章对照 |
+| `AGENTS.md` | 开发规范；pi 用自己开发自己 |
 
 ## 动手实验
 
-1. 画出 pi 四个包的依赖关系图（可以用 `grep -r "from \"@earendil-works" packages/*/src` 看每个包 import 了哪些兄弟包来验证你的图）。确认 `pi-agent-core` 是否真的不 import `pi-ai` 的具体 provider 实现。
-2. 打开 `packages/agent/src/types.ts`，把 `StreamFn` 那段注释里的「契约」翻译成你自己的话讲给同事听：为什么「失败必须编码进流而不是抛异常」对一个 Agent 循环如此重要？（提示：想想如果第 5 个工具调用时模型 API 超时了，你希望前 4 个工具的结果怎么办。）
+1. 用 `node -e` 遍历 `packages/*/package.json`，打印每个包的 `dependencies` 中出现的 `@earendil-works/*`，画出真实依赖图，并与 2.1 节的图对照。
+2. 打开 `packages/agent/src/types.ts`，把 `StreamFn`、`AgentTool.execute`、`AgentToolResult` 三段注释翻译成自己的话。重点回答：为什么工具执行失败要返回 `isError: true` 的结果，而不是抛异常？
+3. 在仓库根执行 `npm run check:entry-graphs`，看看 pi 如何用脚本约束包之间的入口依赖——这是「架构即测试」的一个小例子。

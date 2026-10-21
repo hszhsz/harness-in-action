@@ -1,191 +1,337 @@
-# 第 13 章　自扩展的 Extension 系统：不改核心，装上任意能力
+# 第 13 章　扩展系统与 Pi Packages
 
-> 一个真正可复用的内核，不是「功能全」，而是「留得住口子」。pi 把核心做到极薄，再开出一整面墙的扩展点——于是「加功能」这件事，从「改源码、等发版」变成了「往一个目录里丢一个 `.ts` 文件」。
+> 核心不长大，能力却要长大——唯一的办法是把「长大」这件事交给进程内的插件。
 
-前十二章我们反复看到 pi 的同一句口头禅:**核心只做机制,策略全部外包。** 前面那些「外包」散落在各处——权限外包给容器(第 10 章)、执行后端外包给 `BashOperations`(第 9 章)、压缩策略可被替换(第 12 章)。这一章我们看的是**承接这些外包的总闸门**:Extension 系统。它是 pi 「自扩展」能力的核心——用户不碰一行核心代码,就能给 Agent 装上工具、命令、快捷键、UI 组件,甚至接管权限和上下文。
+如果说前十二章讲的是 pi「已经有什么」，从这一章开始讲 pi「允许你加什么」。
+
+扩展（Extension）是 pi 最重要的可扩展面：它在 pi 进程内运行，拿到的权限和 pi 自己一样，能注册工具、命令、快捷键、CLI 参数、模型 provider、MCP server、渲染器，还能监听几乎每一个生命周期事件并改写其中的数据。
+
+代价也很直接：**扩展是任意代码执行**。所以这一章除了讲「怎么写」，也会讲清楚「它什么时候被加载、能改什么、不能改什么」。
 
 ---
 
-## 13.1 一个扩展长什么样:导出一个工厂函数
+## 13.1 一个扩展的最小形态
 
-先看最小的一个扩展。pi 自带的 `tps` 扩展(`.pi/extensions/tps.ts`),功能是「每轮结束后算一下生成速度(tokens/秒)并提示」,全文不到 50 行:
+扩展是一个 TypeScript 模块，默认导出一个工厂函数：
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	let agentStartMs: number | null = null;
-
-	pi.on("agent_start", () => { agentStartMs = Date.now(); });
-
-	pi.on("agent_end", (event, ctx) => {
-		if (!ctx.hasUI) return;
-		if (agentStartMs === null) return;
-		const elapsedMs = Date.now() - agentStartMs;
-		// ...遍历 event.messages 累加 usage.output...
-		const tokensPerSecond = output / (elapsedMs / 1000);
-		ctx.ui.notify(`TPS ${tokensPerSecond.toFixed(1)} tok/s ...`, "info");
+	pi.registerCommand("hello", {
+		description: "Show a greeting",
+		handler: async (name, ctx) => {
+			ctx.ui.notify(`Hello, ${name || "world"}!`, "info");
+		},
 	});
 }
 ```
 
-这就是一个完整的扩展。它揭示了 pi 扩展模型的三个基本约定:
+不需要编译。pi 用 jiti 直接加载 TypeScript，开发时甚至可以：
 
-1. **一个扩展 = 一个默认导出的工厂函数**,签名是 `(pi: ExtensionAPI) => void`。
-2. **工厂函数在「加载时」运行一次**,它的职责是「**注册**」——通过 `pi.on(...)` 注册事件处理器,通过 `pi.registerTool(...)` 注册工具,等等。
-3. **真正的逻辑在回调里**,回调被调用时会拿到 `(event, ctx)`——`event` 是这次事件的数据,`ctx` 是「当前时刻」的 `ExtensionContext`(能访问 UI、会话、模型……)。
-
-注意 `tps` 用一个闭包变量 `agentStartMs` 在两个事件之间传递状态。扩展就是普通的 JS 模块,闭包、import、任何 npm 包都能用——它不是一种受限的「插件 DSL」,而是**完整的代码**。
-
-## 13.2 加载机制:用 jiti 直接吃 TypeScript
-
-扩展是 `.ts` 文件,但 pi 可以是编译进 Bun 的单文件二进制——它怎么在运行时加载一个用户随手写的 TypeScript?答案是 `jiti`(`core/extensions/loader.ts`):
-
-```ts
-const jiti = createJiti(import.meta.url, {
-	moduleCache: false,
-	...(isBunBinary
-		? { virtualModules: VIRTUAL_MODULES, tryNative: false }  // 二进制:用打包进去的虚拟模块
-		: { alias: getAliases() }),                              // 开发态:别名指到 node_modules
-});
-const module = await jiti.import(extensionPath, { default: true });
-const factory = module as ExtensionFactory;
+```bash
+pi --extension ./hello.ts
 ```
 
-`jiti` 是一个「即时 TypeScript 加载器」——它能在运行时直接 import `.ts`,无需预编译。这里最值得玩味的是 `virtualModules`/`alias` 这对设计:
+扩展的放置位置有三类：
 
-- 扩展里会写 `import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"`,还可能 import `typebox`、`pi-ai`、`pi-tui`。
-- 但扩展是被宿主进程动态加载的,它没有自己的 `node_modules`。这些 import 怎么解析?
-- pi 把这些「扩展可能用到的包」**静态打包进自己**(`VIRTUAL_MODULES`),再通过 jiti 的虚拟模块机制喂给扩展。于是扩展 `import "pi-ai"` 拿到的,正是**宿主自己用的那一份**——版本一致,实例共享,不会出现「两个 pi-ai 互不认识」的诡异 bug。
-
-> **给 Agent 开发者的启示**:让用户写扩展,最大的工程坑不是「怎么执行用户代码」(jiti 一行搞定),而是「**用户代码怎么 import 到你的内部类型和工具**」。pi 的解法——把可被扩展依赖的包静态打包 + 虚拟模块注入——保证了「宿主与扩展共享同一份依赖实例」。这是动态插件系统能稳定工作的隐形地基。
-
-扩展从哪发现?`discoverAndLoadExtensions` 按固定顺序扫三处:**项目本地 `./.pi/extensions/`**、**全局 `~/.pi/extensions/`**、以及配置里**显式指定的路径**。目录里 `*.ts`/`*.js` 直接当扩展;子目录有 `index.ts` 或带 `pi` 字段的 `package.json` 也能被识别成一个扩展包。「往目录里丢个文件就生效」的体验,就是这套发现规则给的。
-
-## 13.3 `ExtensionAPI`:注册方法 vs 动作方法
-
-工厂函数拿到的 `pi: ExtensionAPI`,是扩展能做的一切的总表面。`createExtensionAPI`(`loader.ts`)把它的方法分成泾渭分明的两类。
-
-**第一类:注册方法(registration)——把能力「登记」到扩展对象上。** 它们在加载时调用,往扩展的几张 Map 里写东西:
-
-```ts
-on(event, handler)            // 注册事件处理器 → extension.handlers
-registerTool(tool)            // 注册一个工具 → extension.tools
-registerCommand(name, opts)   // 注册一个 slash 命令 → extension.commands
-registerShortcut(key, opts)   // 注册一个键盘快捷键 → extension.shortcuts
-registerFlag(name, opts)      // 注册一个 CLI flag → extension.flags
-registerMessageRenderer(t, r) // 注册自定义消息的渲染器
-registerProvider(name, config)// 注册一个模型 provider
-```
-
-注意 `registerTool` 一调用就 `runtime.refreshTools()`——新工具能在运行中热插上去。这正是第 8 章 `ToolDefinition` 的归宿:**内置的 7 个工具和扩展注册的工具,走的是同一套 `ToolDefinition` 形状**,扩展工具因此和原生工具完全平权(一样能渲染、能写提示词、能被 `beforeToolCall` 拦)。
-
-**第二类:动作方法(action)——运行时主动「操作」会话。** 它们不是登记,而是真去干事:
-
-```ts
-sendMessage(msg) / sendUserMessage(content)  // 替扩展往会话里发消息
-appendEntry(customType, data)                // 往会话树 append 一个 CustomEntry(第 11 章)
-setModel(model) / setThinkingLevel(level)    // 切模型、切思考强度(都是 append 节点)
-setActiveTools(names) / getActiveTools()     // 动态改激活工具集
-setSessionName(name) / setLabel(id, label)   // 改会话名、打书签
-exec(command, args, opts)                    // 跑一条外部命令
-```
-
-这两类的实现差异很说明问题:注册方法直接写扩展自己的 Map;**动作方法全部 `runtime.xxx()` 转发给一个共享的 `ExtensionRuntime`**。为什么?因为加载扩展时,真正的会话还没就绪——`createExtensionRuntime` 给所有动作方法装的是「抛错的桩」:
-
-```ts
-const notInitialized = () => { throw new Error("Extension runtime not initialized..."); };
-```
-
-等会话准备好,`ExtensionRunner.bindCore()` 才把这些桩**替换成真实现**。于是 pi 优雅地强制了一条规矩:**加载期只能注册,不能动作**。你想在工厂函数顶层就 `pi.sendMessage(...)`?直接抛错——因为那个时刻根本没有会话可发。
-
-## 13.4 事件墙:从 `agent_start` 到 `tool_call` 的二十多个钩子
-
-`pi.on(event, handler)` 里的 `event`,是一个有二十多个成员的联合类型 `ExtensionEvent`。把它们按「Agent 一次运行的生命周期」铺开,就是 pi 暴露给扩展的全部可观测/可干预的点:
-
-| 阶段 | 事件 | 能干什么 |
+| 位置 | 路径 | 是否受项目信任约束 |
 |---|---|---|
-| 项目启动 | `project_trust` / `resources_discover` | 决定是否信任项目、贡献技能/提示词/主题路径 |
-| 一轮开始前 | `before_agent_start` | 改系统提示词、往本轮注入消息 |
-| 运行中 | `agent_start` / `turn_start` / `turn_end` / `agent_end` | 计时、统计、监控(`tps` 用的就是这对) |
-| 消息流 | `message_start` / `message_update` / `message_end` | 观测/改写助手消息(`message_end` 可改写) |
-| **工具准入** | **`tool_call`** | **拦截或改写工具调用(第 10 章的「权限」)** |
-| 工具结果 | `tool_result` | 改写工具返回的内容/details/isError |
-| 工具执行 | `tool_execution_start/update/end` | 观测工具执行进度 |
-| 上下文 | `context` / `before_provider_request` | 发给模型前最后改写消息列表 / 改写原始请求体 |
-| 用户交互 | `input` / `user_bash` | 拦截/转换用户输入、接管 `!` 命令 |
-| 会话操作 | `session_before_switch/fork/compact/tree` | 在切换/分支/压缩/跳转前确认或取消 |
+| 个人级 | `~/.pi/agent/extensions/` | 否 |
+| 项目级 | `.pi/extensions/` | 是 |
+| 显式加载 | `-e/--extension <file>` | 否 |
 
-这面「事件墙」是 pi 全部可扩展性的来源。值得专门拆开看的是**不同事件的「结果语义」并不相同**——`ExtensionRunner` 为它们写了各自的 `emitXxx`:
-
-- **`tool_call`(可拦截)**:`emitToolCall` 顺序过所有处理器,**任意一个返回 `{ block: true }` 就立即短路返回**——这就是第 10 章「软约束」的执行点。注释还点明:想改参数不要返回新值,而是**原地 mutate `event.input`**,后面的处理器能看到改动。
-- **`message_end` / `tool_result`(可改写)**:`emitMessageEnd` / `emitToolResult` 把消息/结果**穿过处理器链**,每个处理器的输出喂给下一个,实现链式改写。
-- **`context`(可改写整个列表)**:`emitContext` 让扩展在「发给模型前」拿到完整消息数组并替换它——做「注入项目规则」「脱敏」「裁剪」都在这。
-- **`session_before_*`(可取消)**:返回 `{ cancel: true }` 就把这次切换/分支/压缩**叫停**——`confirm-destructive` 扩展就靠它在清空会话前弹一句确认。
-- **普通事件(纯观测)**:`agent_start` 这类返回值被忽略,扩展只是「看一眼」。
-
-> 这套「事件 + 分化的结果语义」是 pi 扩展系统的精髓:**不是所有钩子都平等**。有的只能看(观测),有的能改(转换),有的能拦(准入),有的能取消(确认)。pi 没有用一个万能的「中间件」糊弄过去,而是为每种干预强度设计了精确的契约——这让扩展作者一眼就知道「我这个钩子到底有多大权力」。
-
-## 13.5 `ExtensionContext`:回调里那个「当前时刻」的 ctx
-
-每个事件处理器的第二个参数 `ctx`,是 `ExtensionContext`。它和 `ExtensionAPI` 的区别要分清:**`pi`(API)是「注册期」的能力总表;`ctx`(Context)是「回调期」那一刻的运行时快照。**
-
-`createContext`(`runner.ts`)用的全是 **getter**,而非提前算好的值:
-
-```ts
-createContext(): ExtensionContext {
-	return {
-		get ui() { runner.assertActive(); return runner.uiContext; },
-		get model() { runner.assertActive(); return getModel(); },
-		get cwd() { ... },
-		isIdle: () => runner.isIdleFn(),
-		compact: (options) => runner.compactFn(options),
-		getContextUsage: () => runner.getContextUsageFn(),
-		// ...
-	};
-}
-```
-
-为什么坚持用 getter?因为 ctx 必须反映「**读取这一刻**」的真实状态——当前用哪个模型、UI 在不在、会话有没有空闲。如果提前把值快照进对象,扩展拿到的就是「创建 ctx 那一刻」的陈旧值了。`ctx.ui.notify(...)`、`ctx.compact()`、`ctx.getContextUsage()`(查当前 token 用量,连回第 12 章)、`ctx.abort()`——这些都是扩展在回调里「此时此刻」操作 Agent 的把手。
-
-还有一个细节体现 pi 的严谨:`assertActive()`。当会话被替换或重载后,旧的 ctx 会被 `invalidate` 标记为「陈旧」,之后任何对它的访问都直接抛错,并附上一长串解释「不要在 `newSession()`/`fork()` 之后继续用捕获的旧 ctx」。这是在帮扩展作者**尽早暴露「拿着过期上下文乱用」这类隐蔽 bug**。
-
-## 13.6 一个完整的例子:用扩展实现「危险操作确认」
-
-把前面的拼起来,看 `confirm-destructive` 这个官方示例扩展——它用 `session_before_*` 事件在破坏性操作前弹确认:
-
-```ts
-export default function (pi: ExtensionAPI) {
-	pi.on("session_before_switch", async (event, ctx) => {
-		if (!ctx.hasUI) return;          // 没有 UI(如 print 模式)就放行
-		if (event.reason === "new") {
-			const ok = await ctx.ui.confirm("Clear session?", "This will delete all messages...");
-			if (!ok) { ctx.ui.notify("Clear cancelled", "info"); return { cancel: true }; }
-		}
-	});
-	pi.on("session_before_fork", async (event, ctx) => {
-		const choice = await ctx.ui.select(`Fork from entry ${event.entryId.slice(0,8)}?`, [...]);
-		if (choice !== "Yes, create fork") return { cancel: true };
-	});
-}
-```
-
-短短二十行,集齐了所有要素:工厂函数、`pi.on` 注册、回调拿 `(event, ctx)`、用 `ctx.hasUI` 判环境、用 `ctx.ui.confirm/select` 与用户交互、返回 `{ cancel: true }` 取消操作。**这个「危险确认」能力,在很多 Agent 里是写死在核心里的弹窗逻辑;在 pi 里,它只是一个可装可卸的二十行扩展。** 这就是「约束外包」哲学在体验层的兑现——连「要不要二次确认」这种产品决策,pi 都不替你定,而是留成一个口子。
-
-至此我们看清了 pi 自扩展系统的骨架:工厂函数注册、jiti 加载、虚拟模块共享依赖、注册/动作两类 API、二十多个分化语义的事件、getter 式的运行时 ctx。下一章我们看另一种「轻量扩展」——不写代码,只写 Markdown 的 **Skill 与 Slash Command**:如何用一个 `SKILL.md` 文件就给 Agent 注入一套领域知识。
+单文件扩展直接放 `.ts`；多文件扩展放一个目录，入口为 `index.ts`。依赖写在旁边的 `package.json` 里。
 
 ---
 
-## 本章小结
+## 13.2 加载：jiti、虚拟模块与两种运行时
 
-- 一个 pi 扩展 = 一个默认导出的工厂函数 `(pi: ExtensionAPI) => void`;工厂在加载时运行一次,职责是「注册」,真正逻辑在事件回调里(拿 `event` + 当前时刻的 `ctx`)。
-- 加载用 `jiti` 在运行时直接 import TypeScript;关键是用 `virtualModules`/`alias` 把宿主自己的 `pi-ai`/`pi-tui`/`typebox` 等共享给扩展,保证「宿主与扩展同一份依赖实例」。扩展从 `./.pi/extensions/`、全局目录、显式配置路径三处发现。
-- `ExtensionAPI` 分两类:注册方法(`on`/`registerTool`/`registerCommand`/`registerShortcut`/`registerFlag`...)写扩展自己的 Map;动作方法(`sendMessage`/`setModel`/`appendEntry`...)转发给共享 `ExtensionRuntime`。加载期动作方法是抛错桩,`bindCore()` 后才变真——强制「加载期只注册、不动作」。
-- 二十多个事件构成「事件墙」,且结果语义分化:`tool_call` 可拦截(`{block}` 短路、mutate `event.input` 改参数)、`message_end`/`tool_result`/`context` 可链式改写、`session_before_*` 可取消、普通事件纯观测。
-- `ExtensionContext` 全用 getter,反映「读取那一刻」的运行时状态(`ui`/`model`/`compact`/`getContextUsage`...);会话替换后旧 ctx 被 `invalidate`,再用即抛错,帮作者尽早暴露「用过期 ctx」的 bug。
-- 「危险操作确认」这类在别的 Agent 里写死在核心的逻辑,在 pi 里只是一个二十行的可装卸扩展——「约束外包」延伸到了产品体验层。
+### 为什么不是普通 `import()`
 
-下一章,看不写代码、只写 Markdown 的轻量扩展——Skill 与 Slash Command。
+普通 Node 无法直接执行 TypeScript（除非用 strip-types 且不涉及类型擦除以外的语法），也解析不了扩展里对 `@earendil-works/pi-*` 的裸导入——尤其是在 pi 被编译成单文件二进制、根本没有 `node_modules` 的时候。
+
+pi 的解法是 jiti + 虚拟模块（`jiti-loader.ts` / `virtual-modules.ts`）：
+
+```ts
+export const VIRTUAL_MODULES: Record<string, unknown> = {
+	typebox: bundledTypebox,
+	"@earendil-works/pi-agent-core": bundledPiAgentCore,
+	"@earendil-works/pi-tui": bundledPiTui,
+	"@earendil-works/pi-ai": bundledPiAiCompat,
+	"@earendil-works/pi-coding-agent": bundledPiCodingAgent,
+	// 旧包名映射，兼容历史扩展
+	"@mariozechner/pi-ai": bundledPiAiCompat,
+	// ...
+};
+```
+
+也就是说：扩展写 `import { Type } from "typebox"` 或 `import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"` 时，拿到的不是磁盘上的包，而是 **pi 进程自己已经加载的那一份实例**。
+
+这不只是方便。它解决了一个关键问题：**单例一致性**。如果扩展加载了第二份 `pi-ai` 或 `typebox`，就会出现两份类、两个注册表、两套初始化状态——`instanceof` 失败、类型校验行为不一致、provider 注册丢失。虚拟模块让宿主与扩展共享同一份运行时。
+
+### 两种加载路径
+
+`loader.ts` 会根据运行形态选择策略：
+
+- **Node 构建**：使用 dist 别名 + `tryNative`，让 jiti 尽量走原生 ESM；
+- **编译二进制**：使用 `virtualModules`，并把 `tryNative` 关掉；
+- **源码开发**：启用 `tsconfigPaths`，尊重仓库内的路径映射。
+
+同一份扩展代码，在三种形态下都能加载——这是「扩展生态」能成立的前提。
+
+### 生命周期约束
+
+工厂函数可以是 async，pi 会等它完成再继续启动。但文档明确要求：
+
+> Do not start processes, sockets, watchers, or timers in the factory … Start long-lived resources from `session_start` … Close session-scoped resources from an idempotent `session_shutdown` handler.
+
+原因很实际：**有些调用会加载扩展但不启动会话**（例如 `pi config`、只列命令）。在工厂里开定时器，就会留下没人关闭的资源和副作用。
+
+`reload` 更严格：它替换整个扩展运行时，`await ctx.reload()` 之后的代码仍属于旧运行时，不能再碰旧运行时的会话状态。
+
+---
+
+## 13.3 `ExtensionAPI` 能做什么
+
+把 API 按用途分组，比逐个罗列方法更好记：
+
+| 能力 | API | 典型用途 |
+|---|---|---|
+| 监听 / 改写事件 | `pi.on(event, handler)` | 审批、注入上下文、观测 |
+| 注册工具 | `pi.registerTool(tool)` | 让模型调用新能力 |
+| 注册命令 | `pi.registerCommand(name, opts)` | `/deploy`、`/review` |
+| 快捷键 / CLI 参数 | `registerShortcut` / `registerFlag` / `getFlag` | 交互与自动化开关 |
+| 发消息 | `sendMessage` / `sendUserMessage` | 注入提示、排队 steering |
+| 持久化私有状态 | `appendEntry(customType, data)` | 跨会话恢复扩展状态 |
+| 会话控制 | `setModel` / `setThinkingLevel` / `setActiveTools` / `setSessionName` / `setLabel` | 动态调整运行时 |
+| 模型接入 | `registerProvider` / `unregisterProvider` | 代理、私有网关、OAuth |
+| MCP | `registerMcpServer` / `unregisterMcpServer` | 动态挂载工具服务器 |
+| 虚拟模型路由 | `registerVirtualModel` | 按请求特征选模型（见第 5 章） |
+| 渲染 | `registerToolRenderer` / `registerMessageRenderer` / `registerMarkdownTransformer` | 自定义 TUI 呈现 |
+| 跨扩展通信 | `pi.events` | 扩展间事件总线 |
+| 执行命令 | `pi.exec()` | 受控地跑子进程 |
+
+几个容易混淆的点：
+
+- **`appendEntry` 与 `sendMessage` 不是一回事**。前者写 `custom` entry，**不进模型上下文**，只用于扩展自己恢复状态；后者写 `custom_message`，会进上下文。
+- **`registerTool` 的工具描述符是 `ToolDefinition`**，比核心的 `AgentTool` 多出 `promptSnippet`、`promptGuidelines`、`exposure`、`namespace`、`defaultActive`、`prepareLoadout`、渲染器等字段（第 8 章）。注册后由 `wrapToolDefinition()` 适配成核心认识的形状。
+- **`setActiveTools` 只影响「声明给模型」的集合**。`codemode` / `deferred` 暴露的工具即使不在 active 集合里，仍然可以被脚本或工具搜索调用。
+
+---
+
+## 13.4 事件墙：六种组合方式
+
+pi 的事件很多，但它们的**组合语义**只有六种。理解这张表，比背事件名有用得多（`docs/extensions.md`）：
+
+| 模式 | 行为 | 代表事件 |
+|---|---|---|
+| 通知 | 返回值被忽略，只用于观察 | `agent_start`、`tool_execution_start`、`provider_stream_event` |
+| 就地修改 | 后续 handler 看到被改过的字段 | `tool_call.input`、`before_provider_headers.headers` |
+| 链式变换 | 后一个 handler 收到前一个的返回值 | `input`、`context`、`message_end`、`tool_result`、`before_provider_request` |
+| 闸门 | 一旦处理/拦截，就停止默认路径 | `tool_call` 的 block、`user_bash` 的 handled |
+| 可操作边界 | 看到「目前已提议的 entry 与继续决策」，可追加草稿 | `turn_end`、`agent_before_settle` |
+| 最后覆盖 | 最后一个返回动作的 handler 生效 | `cache_warming_decision` |
+
+### 一次模型请求的事件顺序
+
+```text
+context
+  → context_with_system
+    → before_provider_headers
+      → before_provider_request
+        → after_provider_response
+          → provider_stream_event / message_start / message_update / message_end
+            → turn_end
+```
+
+`context` 与 `context_with_system` 的分工值得单独说：
+
+- `context` 只拿到**对话消息**，看不到系统提示词和工具声明。pi 在它返回后会恢复提示词与工具状态，所以它不能借机篡改系统消息。
+- `context_with_system` 拿到**完整转录**，返回值原样使用。代价是你必须自己保证「系统消息仍在索引 0」，否则 provider 会收到非法请求。
+
+这是典型的「默认安全、显式越权」设计：想让扩展碰系统提示词，必须选那个名字更长、语义更危险的钩子。
+
+### 工具执行的事件顺序
+
+```text
+tool_execution_start
+  → tool_call          （可改参数、可 block）
+    → tool_execution_update（执行中的流式进度）
+      → tool_result    （可改写结果）
+        → tool_execution_end
+```
+
+注意 `tool_call` 在 `tool_execution_start` 之后、真正执行之前。这看起来只是顺序问题，实际决定了 UI 可以先画出「正在调用」，再被扩展拦下来改成失败——用户看到的是完整过程，而不是「调用凭空消失」。
+
+### 边界事件：`turn_end` 与 `agent_before_settle`
+
+这两个事件不是「通知」，而是**提交点**。它们的 handler 可以：
+
+- 追加 `custom` / `custom_message` / `context_edit` / `compaction` 草稿；
+- 返回 `continue: true` 请求再进行一次模型请求。
+
+pi 会把所有 handler 的草稿累积起来，在边界处原子提交，然后用提交后的投影决定是否继续。`turn_end` 适合「这一轮做完了，补一条记录/改一条上下文」；`agent_before_settle` 适合「整个 run 即将结束，还有最后一件事」。
+
+文档给了一条硬警告：**无条件 `continue` 会死循环**。边界事件给了扩展「再来一轮」的权力，也把「什么时候停」的责任交给了扩展。
+
+---
+
+## 13.5 自定义工具：从声明到执行
+
+一个最小工具（`examples/extensions/hello.ts`）：
+
+```ts
+const helloTool = defineTool({
+	name: "hello",
+	label: "Hello",
+	description: "A simple greeting tool",
+	parameters: Type.Object({
+		name: Type.String({ description: "Name to greet" }),
+	}),
+	async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		return {
+			content: [{ type: "text", text: `Hello, ${params.name}!` }],
+			details: { greeted: params.name },
+		};
+	},
+});
+
+export default function (pi: ExtensionAPI) {
+	pi.registerTool(helloTool);
+}
+```
+
+`execute` 的五个参数是 1.3 的契约：`toolCallId`、参数、`signal`、`onUpdate`、`ExtensionToolContext`。最后一个参数让工具能访问会话能力（执行嵌套工具、读设置、发消息等），也是 codemode 与 MCP 资源工具能复用同一套钩子的基础。
+
+几条来自官方文档的硬约束：
+
+1. **失败就抛异常**。抛出的错误会变成 `isError: true` 的工具结果；返回对象不会自动标记为错误。
+2. **要报错但仍有数据，返回 `isError: true` + `structuredContent`**。模型看到错误，脚本仍能拿到结构化数据。
+3. **声明 `outputSchema` 时，`structuredContent` 必须匹配**。模型仍然读 `content`；codemode 脚本优先拿 `structuredContent`。
+4. **共享可变状态就声明 `executionMode: "sequential"`**。否则同一批工具会并行执行。
+5. **文件读改写必须用 `withFileMutationQueue()` 包住整个过程**。
+6. **大输出要截断**，并告诉模型去哪里读完整内容。
+7. **嵌套模型调用的 usage 要放进结果**，否则会话账本会漏计。
+
+这些不是风格建议，而是「工具在真实系统里不闯祸」的最低要求。
+
+---
+
+## 13.6 状态、重载与信任
+
+### 扩展状态放哪
+
+- **`appendEntry(customType, data)`**：写进会话文件，重载后可扫描恢复；不进模型上下文。
+- **`sendMessage(...)`**：写 `custom_message`，进上下文，可选择是否显示在 TUI。
+- **内存变量**：只在当前运行时有效，`reload` 后消失。
+
+判断标准很简单：**模型需要知道吗？** 需要 → `sendMessage`；只是扩展自己要记住 → `appendEntry`；两者都不需要 → 内存。
+
+### 项目信任与扩展
+
+项目级扩展是「克隆一个仓库就可能被执行」的典型风险，所以它被项目信任严格闸住（第 10 章）：
+
+- 只有**个人级和命令行显式加载**的扩展，才能参与 `project_trust` 事件；
+- 项目扩展只有在信任通过后才加载；
+- 项目包（Pi Packages）同样如此，且包里的 skill 还可能指示模型去执行程序。
+
+文档的措辞很直白：**扩展以 pi 进程的操作系统权限运行，能看提示词、工具调用、文件、凭证和会话历史。只加载你信任的来源。**
+
+---
+
+## 13.7 Pi Packages：把能力打包分发
+
+扩展、Skill、提示词模板、主题可以作为一个整体分发，这就是 Pi Package。它本质上是一个普通目录或 npm 包：
+
+```text
+my-pi-package/
+├── package.json
+├── extensions/
+├── skills/
+├── prompts/
+└── themes/
+```
+
+没有 `pi` 清单时，pi 按约定目录发现资源；需要精确控制时，用清单：
+
+```json
+{
+  "name": "my-pi-package",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/extension.ts"],
+    "skills": ["./resources/skills"],
+    "prompts": ["./resources/prompts/*.md"],
+    "themes": ["./resources/themes/*.json"]
+  }
+}
+```
+
+### 三种来源
+
+| 来源 | 示例 | 行为 |
+|---|---|---|
+| npm | `pi install npm:@example/pi-tools@1.0.0` | 安装到 pi 的 npm 目录，版本固定 |
+| git | `pi install git:github.com/example/pi-tools@v1` | 克隆并对齐到指定 ref，ref 不随更新移动 |
+| 本地 | `pi install ./local-package` | 直接按路径加载，不复制 |
+
+个人安装写入 `~/.pi/agent/settings.json`；加 `--local` 写入 `.pi/settings.json`，后者要等项目信任通过才读取。
+
+### 依赖规则：宿主提供的必须用 peerDependencies
+
+pi 向扩展提供 `pi-ai`、`pi-agent-core`、`pi-coding-agent`、`pi-tui`、`typebox`。包作者必须把它们列在 `peerDependencies`（`"*"`），**不能列进 `dependencies`，也不能打包**。
+
+原因还是单例：如果包里带了一份物理副本，在编译 ESM 下会绕过模块映射，产生重复的类与注册表。pi 检测到这种 manifest 会直接告警。
+
+其他 Pi 包作为依赖时，必须真的打进发布产物，并通过各自的 `node_modules` 路径引用；不要假设两个包共享同一个依赖实例。
+
+### 资源筛选
+
+settings 里的对象形式可以只加载包的一部分：
+
+```json
+{
+  "packages": [{
+    "source": "npm:@example/pi-tools",
+    "extensions": ["extensions/*.ts", "!extensions/legacy.ts"],
+    "skills": [],
+    "prompts": ["prompts/review.md"]
+  }]
+}
+```
+
+语义：省略 = 全加载；`[]` = 全不加载；`!pattern` = 排除；`+path` / `-path` = 精确包含/排除。筛选只能收窄包自己声明的范围，不能凭空扩大。
+
+---
+
+## 13.8 一个完整的观察型扩展
+
+`examples/extensions/status-line.ts` 展示了「不改任何数据，只观察」的写法：
+
+```ts
+export default function (pi: ExtensionAPI) {
+	let turnCount = 0;
+
+	pi.on("session_start", async (_event, ctx) => {
+		ctx.ui.setStatus("status-demo", ctx.ui.theme.fg("dim", "Ready"));
+	});
+
+	pi.on("turn_start", async (_event, ctx) => {
+		turnCount++;
+		ctx.ui.setStatus("status-demo", ctx.ui.theme.fg("accent", `● Turn ${turnCount}...`));
+	});
+
+	pi.on("turn_end", async (_event, ctx) => {
+		ctx.ui.setStatus("status-demo", ctx.ui.theme.fg("success", `✓ Turn ${turnCount} complete`));
+	});
+}
+```
+
+它揭示了扩展系统的两个性格：
+
+- **UI 是扩展的一等公民**。`ctx.ui` 提供状态栏、通知、选择框、编辑器等能力，扩展不是只能躲在后台。
+- **观察型扩展很便宜**。不返回结果、不改数据，就不会影响主流程；这正是「事件墙」把通知与变换分开的价值。
 
 ---
 
@@ -193,14 +339,17 @@ export default function (pi: ExtensionAPI) {
 
 | 文件 | 作用 |
 |---|---|
-| `packages/coding-agent/src/core/extensions/loader.ts` | `createExtensionAPI`(注册/动作两类方法)、`createExtensionRuntime`(抛错桩)、jiti 加载 + `VIRTUAL_MODULES`、`discoverAndLoadExtensions` 发现规则 |
-| `packages/coding-agent/src/core/extensions/runner.ts` | `ExtensionRunner`:`bindCore` 注入真实现、`createContext`(getter 式 ctx)、各 `emitXxx`(`emitToolCall` 短路、`emitContext`/`emitMessageEnd` 链式、`session_before_*` 取消) |
-| `packages/coding-agent/src/core/extensions/types.ts` | `ExtensionEvent` 联合(二十多个事件)、`ExtensionAPI`/`ExtensionContext`/`ToolCallEventResult` 等接口 |
-| `.pi/extensions/tps.ts` | 最小扩展示例(`agent_start`/`agent_end` 算 tokens/秒) |
-| `packages/coding-agent/examples/extensions/confirm-destructive.ts` | 用 `session_before_*` + `{cancel:true}` 实现破坏性操作确认 |
+| `packages/coding-agent/src/core/extensions/types.ts` | `ExtensionAPI`、全部事件与结果类型、`ToolDefinition` |
+| `packages/coding-agent/src/core/extensions/loader.ts` | 发现、加载、jiti 配置、模块解析 |
+| `packages/coding-agent/src/core/extensions/jiti-loader.ts` / `jiti-static-loader.ts` | Node 构建与编译二进制两种加载路径 |
+| `packages/coding-agent/src/core/extensions/virtual-modules.ts` | 宿主模块映射与旧包名兼容 |
+| `packages/coding-agent/src/core/extensions/runner.ts` | 事件分发、组合语义、工具注册、边界的草稿提交 |
+| `packages/coding-agent/docs/extensions.md` | 官方扩展指南（事件顺序、组合模式、工具约束） |
+| `packages/coding-agent/docs/packages.md` | Pi Packages 的清单、来源、依赖与筛选 |
+| `packages/coding-agent/examples/extensions/` | 可直接运行的真实样例 |
 
 ## 动手实验
 
-1. 照着 `tps.ts` 写一个最小扩展:在 `agent_end` 时用 `ctx.ui.notify` 打印「本轮发了几条消息」。把它丢进 `./.pi/extensions/`,验证「丢文件即生效」。再故意在工厂函数顶层调用 `pi.sendMessage(...)`,观察它为什么会抛 "runtime not initialized"——对照 13.3 的「注册/动作」二分解释原因。
-2. 写一个 `tool_call` 扩展:拦截所有 `bash` 命令里含 `rm` 的调用并 `{ block: true, reason }`。再改成「不拦截而是 mutate `event.input.command` 给 `rm` 加 `-i`」。对照 `emitToolCall` 的源码,解释「为什么 block 会短路、而 mutate 能被后续处理器看到」。
-3. 读 `createContext` 的所有 getter,列出 `ExtensionContext` 暴露了哪些「当前时刻」的能力。重点回答:为什么这些必须是 getter 而非提前算好的值?设想一个扩展捕获了旧 ctx、在 `ctx.newSession()` 之后又用它——`assertActive()` 会发生什么,它为你挡掉了什么 bug?
+1. 写一个 `turn_end` 扩展：每轮结束时用 `appendEntry` 记录本轮工具调用次数，并注册一个 `/stats` 命令读出来。验证它**没有**进入模型上下文。
+2. 把同一个扩展改成在 `turn_end` 返回 `continue: true`，观察循环行为；再加一个「最多继续一次」的计数器，体会文档为什么警告无条件继续。
+3. 写一个扩展，在 `context` 里尝试修改系统提示词，确认无效；再改用 `context_with_system`，并保证系统消息仍在索引 0。解释这两者的安全差异。

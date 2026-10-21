@@ -1,108 +1,236 @@
-# 第 10 章　pi 的「无权限」哲学：把约束外包出去
+# 第 10 章　pi 的「无权限」哲学：刻意不做什么
 
-> 大多数编码 Agent 的安全感来自「问你一句：要执行这条命令吗？」。pi 的安全感来自另一个地方——它根本不在核心里问，而是把「问不问、拦不拦」整件事交给别人。
+> 不内置审批不是忘了写，而是把「该不该拦」留给了最有资格判断的那一层。
 
-前九章我们一路拆下来，会注意到一个反常的事实：pi 的执行内核里**从未出现过「这条命令危险、拒绝执行」之类的判断**。没有危险命令黑名单、没有「写文件前弹窗确认」、没有内置的权限等级。这不是疏忽，是 pi 最核心、也最有争议的设计决策。这一章我们正面解读它：pi 为什么敢「无权限」，它把约束外包到了哪里，以及这套哲学的代价与收益。
+读到这里，你已经见过 pi 的循环、钩子和工具流水线。现在我们来面对整套设计里最容易被误解的一点：
+
+**pi 的核心没有权限系统。**
+
+没有「这个命令危险吗」的规则表，没有「先问用户 Yes/No」的默认流程，没有把工作目录当成牢笼的路径检查。`bash` 工具拿到 `rm -rf` 就会真的执行，`write` 工具拿到 `~/.zshrc` 就会真的写。
+
+但与此同时，你在仓库里又能看到 `project-trust.ts`、`security.md`、`permission-gate.ts`、`protected-paths.ts`、Gondolin、OpenShell……这些看起来都很像「权限」的东西。
+
+这一章要做的，就是把这些概念摆回各自的位置：**核心为什么什么都不做、唯一的闸门长什么样、项目信任到底管什么、真正的安全边界又在哪里。**
 
 ---
 
-## 10.1 一个反直觉的事实：核心里没有权限系统
+## 10.1 核心的三条「不做」
 
-先确认这个事实有多彻底。回顾前面几章的关键节点：
+先看 `pi-agent-core` 明确不做哪三件事。
 
-- 第 3 章 `runLoop` 抽取工具调用、执行、喂回结果——全程没有「该不该执行」的判断。
-- 第 4 章 `beforeToolCall` 钩子能拦截工具，但**它只是一个口子，核心自己从不往里塞任何拦截逻辑**。
-- 第 9 章 `createLocalBashOperations` 老老实实 `spawn` 任何命令——`rm -rf /` 和 `ls` 在它眼里没有区别。
+### 不做一：不在循环里插入审批步骤
 
-对比一下业界的「偏执型」编码 Agent（比如本系列写过的 OpenClaw，其画像是「fail-closed 的偏执狂」），它们往往把权限做成核心的一等公民：每个工具调用前先过一套准入规则，危险操作默认拒绝、要用户显式批准。pi 走了相反的路：**核心只提供机制（一个能拦截的钩子），不提供任何策略（拦什么、怎么拦）。**
+`runLoop` 的 turn 里没有「等待人类确认」这个状态。工具调用被解析、校验后，直接进入执行。整个 `packages/agent` 里没有 UI、没有 `confirm()`、没有「危险命令」字符串匹配。
 
-这正是第 2 章那条红线「约束外包（outsourced constraints）」的兑现。pi 的立场可以概括成一句话：
-
-> 准入控制不是执行内核的职责。内核只负责「忠实地跑循环」，至于「这一步该不该跑」，交给上层的扩展和外层的容器去回答。
-
-## 10.2 约束外包到哪了：两个出口
-
-「不在核心做」不等于「不做」。pi 把约束外包到了两个层次，一软一硬。
-
-**出口一（软，进程内）：`beforeToolCall` 钩子 + 扩展的 `tool_call` 事件。** 这是第 4 章和第 13 章的内容，这里把它放到「权限」语境下重看。每次工具执行前，循环会过 `beforeToolCall`；在应用层，这进一步暴露成扩展能监听的 `tool_call` 事件。这个事件的结果类型，就是 pi「权限」的全部 API 表面：
+审批如果需要存在，只能由调用方通过 `beforeToolCall` 注入。核心只定义这个钩子的形状：
 
 ```ts
-export interface ToolCallEventResult {
-	/** Block tool execution. To modify arguments, mutate `event.input` in place instead. */
+export interface BeforeToolCallResult {
 	block?: boolean;
 	reason?: string;
+	terminate?: boolean;
 }
 ```
 
-就这么两个字段。一个扩展想实现「权限系统」，做法是监听 `tool_call`，自己判断该不该拦，要拦就返回 `{ block: true, reason: "..." }`。注释还点明 `event.input` 是**可变的**——扩展可以原地改写工具参数（比如给 `rm` 强行加上 `-i`），「Later `tool_call` handlers see earlier mutations」。
+这是一份**结果契约**，不是一份策略。核心不知道什么该 block，它只负责「如果钩子说 block，我就把这次调用变成一条错误工具结果」。
 
-关键在于：**拦截的语义是「合成一条带错误的工具结果喂回给模型」，而不是抛异常中断。** 回顾第 4 章 4.3：
+### 不做二：不理解命令语义
+
+pi 不会解析 `rm -rf /`，不会判断某个路径是否越界，不会识别 `curl | sh`。原因很实际：**命令语义是不可判定的**。`bash -c "$(cat script.sh)"`、别名、函数、编码后的 payload，任何基于字符串的规则都能被绕过。
+
+既然做不到可靠，pi 干脆不做「假装可靠」的检查——这比给你一个能被绕过的安全错觉更诚实。
+
+### 不做三：不把工作目录当沙箱
+
+cwd 只决定资源发现的位置（`.pi/`、`.agents/skills`、`AGENTS.md`）和工具的默认根目录。它**不阻止** `bash` 访问 `../..`，不阻止 `read` 读取 `/etc/passwd`。真正的边界只能来自操作系统或虚拟机，见 10.4。
+
+> 一句话总结：核心只提供「调用前可以被拦截」这个**机制**，不提供任何「什么该拦」的**策略**。
+
+---
+
+## 10.2 唯一的闸门：`beforeToolCall`
+
+虽然是「无权限」，但 pi 并不是没有接缝。所有工具调用——包括模型直接发起的、以及工具内部嵌套调用的——都必须经过同一条流水线，闸门就在流水线的第三步。
+
+`packages/agent/src/agent-loop.ts` 的 `prepareToolCall()` 按固定顺序做四件事：
+
+```ts
+const preparedToolCall = prepareToolCallArguments(tool, toolCall); // 1. 修复模型坏参数
+const validatedArgs = validateToolArguments(tool, preparedToolCall); // 2. schema 校验
+const beforeResult = await config.beforeToolCall({...});             // 3. 唯一闸门
+// 4. 通过则执行；block 则生成错误结果
+```
+
+拦截的语义非常克制（[agent-loop.ts:745](file:///Users/heshaozhong/Code/pi/packages/agent/src/agent-loop.ts#L745)）：
 
 ```ts
 if (beforeResult?.block) {
-	return {
-		kind: "immediate",
-		result: createErrorToolResult(beforeResult.reason || "Tool execution was blocked"),
-		isError: true,
-	};
+	const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+	if (beforeResult.terminate === true) {
+		result.terminate = true;
+	}
+	return { kind: "immediate", result, isError: true };
 }
 ```
 
-模型会「看到」自己被拦了、看到原因，于是它可能换个做法。权限拒绝因此也是「错误即数据」的一种——它不打断循环，只是给模型一个反馈信号。
+注意三个细节：
 
-**出口二（硬，进程外）：容器 + 可替换的执行后端。** 这是第 9 章 `BashOperations` 的内容。软约束（钩子）终究跑在同一个进程里，理论上能被绕过、被 bug 穿透。真正硬的隔离来自**把执行环境本身换掉**：把 `BashOperations` 换成「在 Docker / 沙箱容器里执行」的实现，命令就被关进了一个由操作系统级隔离保证的边界。这时候「能不能 `rm -rf`」由容器的文件系统挂载、用户权限、网络策略说了算——**和 pi 一行代码都没关系。**
+1. **block 不是抛异常**。它变成一条 `isError: true` 的工具结果，照常回灌给模型。模型会看到「你被拦了，原因是 X」，然后自己决定换个做法还是停下来。这正是第 4 章讲的「错误即数据」。
+2. **`terminate` 只是提示**。即使拦截了，也只有当整批工具结果都同意终止时循环才会停——单个 block 不会粗暴地掐断整个会话。
+3. **钩子抛异常等于拦截**。扩展在 `tool_call` 里抛错，`AgentSession` 会把它转成「Extension failed, blocking execution」，调用不会被执行。fail-closed 发生在扩展这一层，而不是核心。
 
-两个出口的分工很清楚：
+### 扩展如何接管这道闸门
 
-| 出口 | 层次 | 强度 | 谁来定策略 |
-|---|---|---|---|
-| `tool_call` / `beforeToolCall` | 进程内（软） | 可被绕过，但灵活 | 扩展作者 |
-| 容器 + `BashOperations` | 进程外（硬） | OS 级隔离 | 部署者 / 运维 |
+`AgentSession` 把 `beforeToolCall` 接到了扩展总线上（[agent-session.ts:653](file:///Users/heshaozhong/Code/pi/packages/coding-agent/src/core/agent-session.ts#L653)）：
 
-> **给 Agent 开发者的启示**：「安全」不是单一开关，而是分层的。pi 的洞见是——**不要把这两层混进执行内核**。内核越是对「该不该做」无知，它就越纯净、越可复用、越可测试。安全策略应该长在内核之外、能按部署场景自由组合的地方。
+```ts
+this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
+this.agent.afterToolCall = (context) => this._afterToolCall(context);
+```
 
-## 10.3 为什么这样设计：精简、可复用、可演进
+扩展的 `tool_call` 处理器按注册顺序执行，**第一个返回 `{ block: true }` 的处理器直接终止后续处理**（`runner.ts:1249`）。这让「多个策略叠加」有了确定的优先级：谁先注册谁先说话。
 
-把权限踢出核心，pi 换来了三样东西。
+仓库里给了两个最小范例，可以直接拿来改成你自己的策略：
 
-**1. 核心精简到可以被任何场景复用。** 一个内置了权限系统的内核，必然背着「什么算危险」的假设——而这套假设在不同场景下是矛盾的：本地开发者希望少打扰、CI 环境希望全自动、企业环境希望严格审批。把策略留在核心，就等于强迫所有场景接受同一套假设。pi 把它抽走，于是同一个 `pi-agent-core` 既能裸奔（本地信任环境），又能被一个偏执扩展武装成 fail-closed，还能被关进容器全自动跑——内核一行不改。
+- `examples/extensions/permission-gate.ts`：匹配 `rm -rf`、`sudo`、`chmod 777`，有 UI 就弹窗，没 UI 就直接 block（非交互模式 fail-closed）。
+- `examples/extensions/protected-paths.ts`：拦截对 `.env`、`.git/`、`node_modules/` 的 `write`/`edit`。
 
-**2. 权限策略可以独立演进。** 因为权限是扩展，它的迭代节奏和核心解耦。你想加一条「禁止 push 到 main 分支」的规则，写个扩展即可，不用动核心、不用等核心发版。第 6 章 `sourceId` 的卸载机制在这里也呼应上了——权限扩展可以干净地装上、卸下。
+```ts
+pi.on("tool_call", async (event, ctx) => {
+	if (event.toolName !== "bash") return undefined;
+	if (!isDangerous(event.input.command as string)) return undefined;
+	if (!ctx.hasUI) return { block: true, reason: "Dangerous command blocked (no UI)" };
+	const choice = await ctx.ui.select(`Allow?\n\n${event.input.command}`, ["Yes", "No"]);
+	return choice === "Yes" ? undefined : { block: true, reason: "Blocked by user" };
+});
+```
 
-**3. 可测试性。** 这是第 2 章反复强调的。一个不含策略判断的内核，测试时不必构造「危险命令」「权限矩阵」这些场景，只需验证「钩子被正确调用、拦截结果被正确喂回」这一条机制。策略的测试则归扩展自己。机制与策略各测各的，都简单。
+这段代码就是 pi 全部的「内置权限系统」——它在 examples 里，不在 core 里。
 
-## 10.4 代价与边界：这套哲学不是免费的
+### 嵌套调用也绕不过去
 
-诚实地说，「无权限」哲学有明确的代价，回避它就成了吹捧。
+工具可以调用工具（codemode、MCP 资源工具、subagent 等）。pi 为此提供了 `runToolCall()`（[agent-loop.ts:811](file:///Users/heshaozhong/Code/pi/packages/agent/src/agent-loop.ts#L811)），它复用完全相同的 prepare → validate → before → execute → after 流程，只是不发事件、不落消息。`AgentSession` 还会给嵌套调用补上 `parentToolCallId`，让扩展知道「这一次调用是谁发起的」。
 
-**代价一：开箱即不安全。** 一个裸 `pi-coding-agent`，如果不装权限扩展、不放进容器，它就是「言听计从」的——模型让它 `rm -rf` 它就 `rm -rf`。安全性被**外移成了部署者的责任**。对不读文档、直接裸跑的用户，这是真实的风险。这与 fail-closed 型 Agent「默认拒绝、宁可烦人也不出事」的取向恰好相反——pi 默认 fail-open，把信任前置了。
-
-**代价二：软约束可被绕过。** 进程内的 `tool_call` 拦截，本质是「君子协定」级别的防护。一个有 bug 的扩展、一条没被钩子覆盖到的执行路径，都可能让拦截失效。pi 自己也清楚这一点——所以它把「真正的安全」寄托在出口二（容器），而非出口一（钩子）。**钩子是为了体验和软策略，容器才是为了安全边界。** 把两者的强度搞混，是误用 pi 的常见方式。
-
-**代价三：心智负担转移。** 用户/部署者必须理解「我现在跑在哪种约束下」。这要求使用者具备一定的工程素养——这也是为什么 pi 更像「给工程师的可组装内核」，而非「给所有人的开箱即用产品」。
-
-那么 pi 适合谁？
-
-- ✅ 信任环境下的本地开发（开发者对自己的机器和任务有掌控）。
-- ✅ 已经有容器/沙箱基础设施的团队(把 pi 关进现成的隔离里)。
-- ✅ 需要深度定制权限策略的场景（用扩展实现自己的规则，而非迁就内置规则）。
-- ⚠️ 把它直接暴露给不可信输入、又不加任何隔离——这是误用。
-
-这套权衡没有绝对的对错，它是一个**立场**：pi 赌的是「约束应该由了解部署环境的人来配置，而不是由内核作者预设」。理解了这个立场，你就理解了 pi 全部设计的底色——前面九章那些「核心只做机制、策略全部外包」的设计，都是这个立场的一致延伸。
-
-至此第四部分（工具与执行）讲完。从下一章起进入第五部分，我们转向 pi 另一个独到的设计——状态管理:会话不是一条线性记录,而是一棵可以分支、回溯、压缩的树。
+这意味着：**只要你的策略挂在 `tool_call` 上，它不会因为工具套了一层壳就失效。**
 
 ---
 
-## 本章小结
+## 10.3 项目信任不是权限系统
 
-- pi 执行内核里没有任何权限/准入判断：没有危险命令黑名单、没有内置确认弹窗——这是刻意的「核心只做机制、不做策略」。
-- 约束被外包到两个出口:进程内的 `tool_call`/`beforeToolCall` 钩子（软,`{ block, reason }` + 可变 `input`,拦截以「错误工具结果」喂回而非抛异常）；进程外的容器 + 可替换 `BashOperations`（硬,OS 级隔离）。
-- 钩子负责体验与软策略，容器负责真正的安全边界；把两者强度混淆是误用 pi 的典型方式。
-- 收益:核心精简到可被任何场景复用、权限策略可独立演进、可测试性强。
-- 代价:开箱即不安全(默认 fail-open)、软约束可被绕过、心智负担转移给部署者。pi 是「给工程师的可组装内核」,赌的是「约束该由懂部署环境的人配置」。
+很多人第一次看到 `trust.json` 和启动时的「Trust project folder?」提示，会以为那就是 pi 的权限系统。不是。它管的事情完全不同。
 
-下一章，进入第五部分，看 pi 如何把会话建模成一棵 append-only 的 JSONL 树。
+### 它解决的问题：启动时要不要加载这个目录里的代码
+
+项目目录里可能藏着 `.pi/extensions/*.ts`——这些是**会直接在 pi 进程里执行的代码**。如果 clone 一个恶意仓库、进去执行 `pi`，扩展就被静默加载了，这比模型乱跑命令更危险，因为它发生在你看到任何界面之前。
+
+所以 pi 在启动阶段加了一道闸：检测到项目里有「需要信任的资源」时，先问一句。
+
+需要信任的资源清单（`trust-manager.ts:30`）：
+
+```ts
+const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
+	"settings.json", "mcp.json", "extensions", "skills",
+	"prompts", "themes", "SYSTEM.md", "APPEND_SYSTEM.md",
+];
+```
+
+外加当前目录或祖先目录下的 `.agents/skills`（用户级的 `~/.agents/skills` 除外）。
+
+### 决策顺序
+
+`resolveProjectTrusted()`（[project-trust.ts:47](file:///Users/heshaozhong/Code/pi/packages/coding-agent/src/core/project-trust.ts#L47)）按固定优先级决策：
+
+```ts
+if (options.trustOverride !== undefined) return options.trustOverride;   // 1. --approve / --no-approve
+if (!hasTrustRequiringProjectResources(cwd)) return true;                // 2. 没有受保护资源，直接放行
+// 3. 扩展的 project_trust 事件，第一个给出 yes/no 的说了算
+// 4. ~/.pi/agent/trust.json 里最近的已保存决策（含父目录）
+// 5. defaultProjectTrust：always / never / ask（默认 ask）
+// 6. 有 UI 则弹窗；无 UI 则 false
+```
+
+几个容易忽略的点：
+
+- **没有受保护资源就完全跳过询问**。一个空的 `.pi` 目录不触发信任流程。
+- **保存的决策会向上查找父目录**。在 monorepo 根信任一次，子目录都继承；子目录也可以单独覆盖。
+- **非交互模式（print / JSON / RPC）没有弹窗**。`defaultProjectTrust: "ask"` 在无 UI 时等同于拒绝。自动化里要显式传 `--approve` 或设为 `always`。
+- **信任只影响「加载什么」，不影响「执行什么」**。信任之后，工具仍然以 pi 进程的操作系统权限运行。
+
+### 它明确不承诺的事
+
+官方文档把话说得很直（`docs/security.md`）：
+
+> Project trust controls which project resources load at startup, but it does not make that content or the resulting actions safe. … Watching the transcript, using project trust, and reviewing changes do not create a security boundary.
+
+还有两个刻意留下的缺口：
+
+- **`sessionDir` 在信任决策之前就被读取**。因为要先知道会话存哪，才能选/建会话。拒绝信任也无法撤销这次读取。
+- **`AGENTS.md` / `CLAUDE.md` / `AGENTS.override.md` 无论信任与否都会加载**。它们只是文本，但文本可以影响模型——这属于 prompt injection 的范畴，不是启动信任能解决的。
+
+所以正确的理解是：**项目信任是一道「启动期代码加载闸」，不是「运行期行为闸」。** 前者防的是「还没开始对话就被执行」，后者才是权限系统要防的「对话过程中做坏事」。pi 把后者完全外包了。
+
+---
+
+## 10.4 真正的边界：操作系统、容器、虚拟机
+
+既然核心不拦，那安全从哪里来？pi 的答案只有一句：**来自 pi 进程之外。**
+
+`docs/security.md` 给了一张非常清晰的表：
+
+| 运行方式 | 被保护的是什么 | 局限 |
+|---|---|---|
+| 直接用当前用户权限跑 | 该用户无权访问的一切 | 仍与同机其他进程共享文件与网络 |
+| 整个 pi 跑在容器 / VM / 沙箱里 | 未挂载进环境的主机文件与进程 | 挂进去的凭证、网络仍然可达 |
+| pi 在主机，只有内置工具进隔离环境 | 通过这些工具访问的主机资源 | pi 自身和未走隔离后端的扩展仍在边界外 |
+
+`docs/containerization.md` 进一步把主流方案摊开：
+
+| 方案 | pi 在哪跑 | 隔离了什么 | 凭证处理 |
+|---|---|---|---|
+| Plain Docker | 容器 | pi、内置工具、`!` 命令、扩展 | 凭证传入容器 |
+| Docker Sandboxes | 托管沙箱 | 同上 | 真实 key 留在主机，由代理替换 |
+| OpenShell | 本地/远程沙箱 | pi 全进程 | 策略化凭证与推理路由 |
+| Gondolin 扩展 | 主机 | 只有内置工具与 `!` 命令 | pi 的凭证留在主机，但命令继承主机环境变量 |
+
+这张表最重要的信息不是「用哪个」，而是**边界画在哪里**：
+
+- 整个进程进容器，扩展也进容器，边界最完整；
+- 只把内置工具路由进 Gondolin 微 VM，pi 进程和**其他扩展工具**仍在主机——如果某个扩展自己实现了 `bash`，它就绕过了 VM。文档专门警告了这一点。
+
+换句话说：**沙箱的有效性取决于你是否把所有执行路径都关进去，而不是取决于你装了什么插件。**
+
+---
+
+## 10.5 代价、收益，以及你该怎么补
+
+### 这笔交易换来了什么
+
+| 收益 | 具体表现 |
+|---|---|
+| 核心极小 | 循环里没有策略分支，行为可预测、易测试 |
+| 策略可组合 | 审批、路径保护、审计、限流都能以扩展形式叠加，互不绑架 |
+| 不制造安全幻觉 | 不会让你因为「它拦了 rm -rf」就以为它能拦住所有危险 |
+| 适配任何环境 | 同一内核可以裸跑、进容器、走远程、嵌进 CI |
+
+### 代价是什么
+
+| 代价 | 具体表现 |
+|---|---|
+| 默认不安全 | 首次运行没有任何确认，模型让干啥就干啥 |
+| 责任转移 | 使用者必须自己想清楚「边界放在哪一层」 |
+| 策略质量参差 | 字符串匹配的 permission-gate 很容易被绕过，而它看起来像安全措施 |
+| 非交互场景易踩坑 | `defaultProjectTrust: "ask"` 在无 UI 时静默拒绝；扩展在无 UI 时若忘了 fail-closed，就等于放行 |
+
+### 一个务实的加约束顺序
+
+如果你要把 pi 用在真实项目里，建议按这个顺序加，而不是一上来写规则：
+
+1. **先画进程边界**：能不能整个跑进容器/VM？能，就先做这个——它比任何字符串规则都可靠。
+2. **再收紧凭证**：短生命周期、最小 scope、别把 `~/.pi/agent` 挂进容器。
+3. **然后加行为策略**：用 `tool_call` 拦真正不可逆的操作（推远端、删数据、写生产配置），并且**无 UI 时默认 block**。
+4. **最后加可观测**：把 `tool_execution_start/end`、`tool_result` 记进审计日志——事后能查，比事前猜更现实。
+
+这也解释了为什么 pi 把 `permission-gate.ts` 放在 examples 而不是 core：**它示范的是「怎么写策略」，而不是「策略应该是什么」。** 你的项目该拦什么，只有你知道。
 
 ---
 
@@ -110,12 +238,19 @@ if (beforeResult?.block) {
 
 | 文件 | 作用 |
 |---|---|
-| `packages/coding-agent/src/core/extensions/types.ts` | `ToolCallEvent`、`ToolCallEventResult`（`block`/`reason`）——pi「权限」的全部 API 表面 |
-| `packages/agent/src/agent-loop.ts` | `beforeToolCall` 的真实调用点；拦截 → `createErrorToolResult` 喂回 |
-| `packages/coding-agent/src/core/tools/bash.ts` | `BashOperations` 可替换执行后端——硬隔离的注入点 |
+| `packages/agent/src/types.ts` | `BeforeToolCallResult` / `BeforeToolCallContext` 契约 |
+| `packages/agent/src/agent-loop.ts` | `prepareToolCall()`：唯一闸门；`runToolCall()`：嵌套调用复用同一流水线 |
+| `packages/coding-agent/src/core/agent-session.ts` | 把 `beforeToolCall` 接到扩展 `tool_call` 总线 |
+| `packages/coding-agent/src/core/extensions/runner.ts` | `emitToolCall()`：首个 block 终止后续处理器 |
+| `packages/coding-agent/src/core/project-trust.ts` | 启动期信任决策的完整优先级 |
+| `packages/coding-agent/src/core/trust-manager.ts` | 受保护资源清单、`trust.json` 读写与父目录继承 |
+| `packages/coding-agent/docs/security.md` | 官方安全模型：信任不是边界 |
+| `packages/coding-agent/docs/containerization.md` | Docker / Sandboxes / OpenShell / Gondolin 的边界对比 |
+| `packages/coding-agent/examples/extensions/permission-gate.ts` | 最小审批策略 |
+| `packages/coding-agent/examples/extensions/protected-paths.ts` | 最小路径保护策略 |
 
 ## 动手实验
 
-1. 写一个「最小权限扩展」：监听 `tool_call`，对所有 `bash` 命令里含 `rm` 的调用返回 `{ block: true, reason: "禁止删除操作" }`。观察模型收到拦截后的反应，体会「拦截 = 喂回错误数据」而非「抛异常」。
-2. 把同一个扩展改成「不拦截、而是改写」：监听 `tool_call`，原地给 `rm` 命令的 `event.input.command` 加上 `-i`。验证 10.2 说的「`input` 可变、后续 handler 能看到改动」。
-3. 对照本系列其他 Agent（如 fail-closed 的 OpenClaw），写一段 200 字的对比：同样面对「模型想跑一条没见过的命令」，两者的默认行为分别是什么？各自的代价是什么？你的项目更适合哪一种？
+1. 写一个 `tool_call` 扩展，要求：`bash` 中出现 `git push` 时，有 UI 就确认，无 UI 就 block，并在 block 的 `reason` 里写清楚「为什么拦、该怎么改」。跑一次 `pi -p "..."`（无 UI），确认模型收到的是错误工具结果而不是会话中断。
+2. 在一个含 `.pi/extensions/hello.ts` 的临时目录里分别执行 `pi --no-approve` 和 `pi --approve`，观察扩展是否加载；再删掉 `.pi` 下所有受保护资源，确认不再出现信任提示。
+3. 用 Gondolin 示例把内置工具路由进微 VM，然后写一个自定义 `bash` 扩展（不复用 `BashOperations`），思考：它是否绕过了边界？这验证了 10.4 的哪一句话？
